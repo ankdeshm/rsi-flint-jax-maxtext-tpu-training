@@ -575,6 +575,11 @@ def main() -> None:
     parser.add_argument("--sweep-v5p32-r7", action="store_true", help="Run Round 7 32-chip (2x4x4) HSDP 2x16 mb=80..112 + ga=4 + HSDP 4x8 + 4K frontier sweep")
     parser.add_argument("--sweep-v7x16-r7", action="store_true", help="Run Round 7 Ironwood v7x-16 (2x2x4, 32 TensorCores) FSDP=32 + HSDP 2x16 + HSDP 4x8 frontier sweep")
     parser.add_argument("--sweep-v7x16-r8", action="store_true", help="Run Round 8 Ironwood v7x-16 (2x2x4, 32 TensorCores) HBM-calibrated mb=32..64 + HSDP 2x16 + EP=4 sweep")
+    parser.add_argument("--sweep-v5p16-r8", action="store_true", help="Run Round 8 16-chip (2x2x4) high-AI 4K/8K/16K long-context FSDP=16 MFU frontier sweep")
+    parser.add_argument("--sweep-v5p32-r8", action="store_true", help="Run Round 8 32-chip (2x4x4) high-AI 4K/8K/16K long-context HSDP 2x16 MFU frontier sweep")
+    parser.add_argument("--sweep-v7x16-r9", action="store_true", help="Run Round 9 Ironwood v7x-16 4K/8K/16K/32K/64K long-context MFU frontier sweep")
+    parser.add_argument("--sweep-v5p16-r9", action="store_true", help="Run Round 9 16-chip (2x2x4) 32K/64K/128K ultra-long-context + shared_mem=32% MFU frontier sweep")
+    parser.add_argument("--sweep-v5p32-r9", action="store_true", help="Run Round 9 32-chip (2x4x4) 32K/64K/128K ultra-long-context + shared_mem=32% MFU frontier sweep")
     parser.add_argument("--sweep-output-dir", type=str, default="/scratch/results", help="Local directory for sweep JSON outputs")
     parser.add_argument("--gcs-results-prefix", type=str, default="flint-jax-training/results", help="GCS prefix for immediate result upload")
     args = parser.parse_args()
@@ -654,10 +659,71 @@ def main() -> None:
         or args.sweep_v5p32_r7
         or args.sweep_v7x16_r7
         or args.sweep_v7x16_r8
+        or args.sweep_v5p16_r8
+        or args.sweep_v5p32_r8
+        or args.sweep_v7x16_r9
+        or args.sweep_v5p16_r9
+        or args.sweep_v5p32_r9
     ):
         import json as _json
 
-        if args.sweep_v7x16_r8:
+        if args.sweep_v5p16_r9:
+            # Ultra-high arithmetic-intensity 32K/64K/128K SplashAttention + ragged_dot frontier on v5p-16 (FSDP=16)
+            sweep_specs = [
+                ("jax_v5p16_r9_01_fsdp16_s32768_mb6_ga2_sa1024", 32768, 6, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r9_02_fsdp16_s65536_mb3_ga2_sa1024", 65536, 3, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r9_03_fsdp16_s131072_mb1_ga4_sa1024", 131072, 1, 4, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r9_04_fsdp16_s4096_mb56_ga2_sa1024", 4096, 56, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r9_05_fsdp16_s8192_mb28_ga2_sa1024", 8192, 28, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r9_06_fsdp16_s32768_mb8_ga2_sa1024", 32768, 8, 2, 49, 0, 1024, 1, 16, 1, 1),
+            ]
+            summary_filename = "jax_v5p16_r9_sweep_summary.json"
+        elif args.sweep_v5p32_r9:
+            # Ultra-high arithmetic-intensity 32K/64K/128K SplashAttention + ragged_dot frontier on v5p-32 (HSDP 2x16)
+            sweep_specs = [
+                ("jax_v5p32_r9_01_dp2_fsdp16_s32768_mb6_ga2_sa1024", 32768, 6, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r9_02_dp2_fsdp16_s65536_mb3_ga2_sa1024", 65536, 3, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r9_03_dp2_fsdp16_s131072_mb1_ga4_sa1024", 131072, 1, 4, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r9_04_dp2_fsdp16_s4096_mb56_ga2_sa1024", 4096, 56, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r9_05_dp2_fsdp16_s8192_mb28_ga2_sa1024", 8192, 28, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r9_06_dp2_fsdp16_s32768_mb8_ga2_sa1024", 32768, 8, 2, 49, 0, 1024, 2, 16, 1, 1),
+            ]
+            summary_filename = "jax_v5p32_r9_sweep_summary.json"
+        elif args.sweep_v5p16_r8:
+            # High-arithmetic-intensity 4K/8K/16K SplashAttention + ragged_dot frontier on v5p-16 (FSDP=16)
+            sweep_specs = [
+                ("jax_v5p16_r8_01_fsdp16_s4096_mb56_ga2_sa1024", 4096, 56, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r8_02_fsdp16_s4096_mb64_ga2_sa1024", 4096, 64, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r8_03_fsdp16_s8192_mb24_ga2_sa1024", 8192, 24, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r8_04_fsdp16_s8192_mb32_ga2_sa1024", 8192, 32, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r8_05_fsdp16_s16384_mb12_ga2_sa1024", 16384, 12, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_v5p16_r8_06_fsdp16_s16384_mb16_ga2_sa1024", 16384, 16, 2, 49, 0, 1024, 1, 16, 1, 1),
+            ]
+            summary_filename = "jax_v5p16_r8_sweep_summary.json"
+        elif args.sweep_v5p32_r8:
+            # High-arithmetic-intensity 4K/8K/16K SplashAttention + ragged_dot frontier on v5p-32 (HSDP 2x16)
+            sweep_specs = [
+                ("jax_v5p32_r8_01_dp2_fsdp16_s4096_mb56_ga2_sa1024", 4096, 56, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r8_02_dp2_fsdp16_s4096_mb64_ga2_sa1024", 4096, 64, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r8_03_dp2_fsdp16_s8192_mb24_ga2_sa1024", 8192, 24, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r8_04_dp2_fsdp16_s8192_mb32_ga2_sa1024", 8192, 32, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r8_05_dp2_fsdp16_s16384_mb12_ga2_sa1024", 16384, 12, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r8_06_dp2_fsdp16_s16384_mb16_ga2_sa1024", 16384, 16, 2, 49, 0, 1024, 2, 16, 1, 1),
+            ]
+            summary_filename = "jax_v5p32_r8_sweep_summary.json"
+        elif args.sweep_v7x16_r9:
+            # Ironwood v7x-16 (32 TensorCores) HSDP 2x16 2K -> 4K -> 8K -> 16K -> 32K -> 64K MFU frontier
+            sweep_specs = [
+                ("jax_v7x16_r9_01_dp2_fsdp16_s4096_mb32_ga2_sa1024", 4096, 32, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r9_02_dp2_fsdp16_s8192_mb16_ga2_sa1024", 8192, 16, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r9_03_dp2_fsdp16_s16384_mb8_ga2_sa1024", 16384, 8, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r9_04_dp2_fsdp16_s32768_mb4_ga2_sa1024", 32768, 4, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r9_05_dp2_fsdp16_s65536_mb2_ga2_sa1024", 65536, 2, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r9_06_dp2_fsdp16_s131072_mb1_ga2_sa1024", 131072, 1, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r9_07_fsdp16_ep2_s2048_mb32_ga2_sa1024", 2048, 32, 2, 49, 0, 1024, 1, 16, 2, 1),
+            ]
+            summary_filename = "jax_v7x16_r9_sweep_summary.json"
+        elif args.sweep_v7x16_r8:
             # (exp_name, seq_len, mb, ga, remat_n, save_splash, sa_block, dp, fsdp, ep, tp)
             sweep_specs = [
                 ("jax_v7x16_r8_01_dp2_fsdp16_s2048_mb32_ga2_sa1024", 2048, 32, 2, 49, 0, 1024, 2, 16, 1, 1),
