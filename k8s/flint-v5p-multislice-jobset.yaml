@@ -16,6 +16,7 @@ metadata:
     app: flint-v5p-multislice-train
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     job-name: flint-v5p-multislice-4x2x2x1
 ---
@@ -52,12 +53,10 @@ spec:
         cloud.google.com/gke-spot: "true"
       tolerations:
         - key: "google.com/tpu"
-          operator: "Equal"
-          value: "present"
+          operator: "Exists"
           effect: "NoSchedule"
         - key: "cloud.google.com/gke-spot"
-          operator: "Equal"
-          value: "true"
+          operator: "Exists"
           effect: "NoSchedule"
       volumes:
         - name: dshm
@@ -67,21 +66,19 @@ spec:
           emptyDir: {}
       containers:
         - name: jax-tpu-trainer
-          image: us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/maxtext/maxtext:latest
-          imagePullPolicy: Always
-          securityContext:
-            privileged: true
+          image: us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/torchtpu/torchtitan-flint:v0.2.0
+          imagePullPolicy: IfNotPresent
           env:
             - name: JAX_PLATFORMS
               value: "tpu,cpu"
-            - name: ENABLE_PJRT_COMPATIBILITY
-              value: "true"
+            - name: GRPC_DNS_RESOLVER
+              value: "native"
             - name: GCS_BUCKET_ROOT
               value: "gs://YOUR_GCS_BUCKET/flint-jax-training"
             - name: BASE_OUTPUT_DIR
               value: "gs://YOUR_GCS_BUCKET/flint-jax-training/checkpoints"
             - name: MEGASCALE_COORDINATOR_ADDRESS
-              value: "flint-v5p-multislice-4x2x2x1-0.flint-v5p-multislice-headless.default.svc.cluster.local:8476"
+              value: "flint-v5p-multislice-4x2x2x1-0.flint-v5p-multislice-headless.default.svc.cluster.local:8482"
             - name: MEGASCALE_NUM_SLICES
               value: "4"
             - name: MEGASCALE_SLICE_ID
@@ -90,25 +87,23 @@ spec:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
             - name: LIBTPU_INIT_ARGS
               value: >-
-                --xla_tpu_scoped_vmem_limit_kib=81920
+                --xla_tpu_scoped_vmem_limit_kib=65536
                 --xla_tpu_overlap_compute_collective_tc=true
                 --xla_enable_async_all_gather=true
+                --xla_tpu_enable_ag_backward_pipelining=true
                 --xla_tpu_enable_data_parallel_all_reduce_opt=true
                 --xla_tpu_data_parallel_opt_different_sized_ops=true
                 --xla_tpu_use_minor_sharding_for_major_trivial_input=true
                 --xla_tpu_relayout_group_size_threshold_for_reduce_scatter=1
                 --xla_tpu_assign_all_reduce_scatter_layout=true
-                --xla_tpu_enable_all_experimental_scheduler_features=true
                 --xla_tpu_enable_scheduler_memory_pressure_tracking=true
                 --xla_tpu_host_transfer_overlap_limit=24
-                --xla_tpu_aggressive_opt_barrier_removal=ENABLED
-                --xla_lhs_prioritize_async_depth_over_stall=ENABLED
-                --xla_tpu_enable_ag_backward_pipelining=true
-                --xla_should_allow_loop_variant_parameter_in_chain=ENABLED
-                --xla_should_add_loop_invariant_op_in_chain=ENABLED
                 --xla_max_concurrent_host_send_recv=100
-                --xla_tpu_scheduler_percent_shared_memory_limit=100
+                --xla_tpu_scheduler_percent_shared_memory_limit=60
                 --xla_latency_hiding_scheduler_rerun=2
+                --xla_tpu_use_enhanced_launch_barrier=false
+                --slicebuilder_use_insecure_grpc=true
+                --undefok=slicebuilder_use_insecure_grpc
           resources:
             requests:
               google.com/tpu: 4

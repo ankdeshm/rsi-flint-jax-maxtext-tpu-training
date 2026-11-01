@@ -15,6 +15,7 @@ metadata:
     app: flint-v5p-train
 spec:
   clusterIP: None
+  publishNotReadyAddresses: true
   selector:
     job-name: flint-v5p-2x2x4-bf16-train
 ---
@@ -36,8 +37,6 @@ spec:
       labels:
         app: flint-v5p-train
     spec:
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
       subdomain: flint-v5p-headless
       restartPolicy: OnFailure
       nodeSelector:
@@ -46,12 +45,10 @@ spec:
         cloud.google.com/gke-spot: "true"
       tolerations:
         - key: "google.com/tpu"
-          operator: "Equal"
-          value: "present"
+          operator: "Exists"
           effect: "NoSchedule"
         - key: "cloud.google.com/gke-spot"
-          operator: "Equal"
-          value: "true"
+          operator: "Exists"
           effect: "NoSchedule"
       volumes:
         - name: dshm
@@ -61,27 +58,25 @@ spec:
           emptyDir: {}
       containers:
         - name: jax-tpu-trainer
-          image: us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/maxtext/maxtext:latest
-          imagePullPolicy: Always
-          securityContext:
-            privileged: true
+          image: us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/torchtpu/torchtitan-flint:v0.2.0
+          imagePullPolicy: IfNotPresent
           env:
             - name: JAX_PLATFORMS
               value: "tpu,cpu"
-            - name: ENABLE_PJRT_COMPATIBILITY
-              value: "true"
+            - name: GRPC_DNS_RESOLVER
+              value: "native"
             - name: GCS_BUCKET_ROOT
               value: "gs://YOUR_GCS_BUCKET/flint-jax-training"
             - name: BASE_OUTPUT_DIR
               value: "gs://YOUR_GCS_BUCKET/flint-jax-training/checkpoints"
             - name: HF_MODEL_ID
               value: "RecursiveSI/flint"
-            # TPU v5p MoE XLA compiler flags from AI-Hypercomputer/tpu-recipes/tree/main/training/v5p
             - name: LIBTPU_INIT_ARGS
               value: >-
-                --xla_tpu_scoped_vmem_limit_kib=81920
+                --xla_tpu_scoped_vmem_limit_kib=65536
                 --xla_tpu_overlap_compute_collective_tc=true
                 --xla_enable_async_all_gather=true
+                --xla_tpu_enable_ag_backward_pipelining=true
                 --xla_tpu_enable_data_parallel_all_reduce_opt=true
                 --xla_tpu_data_parallel_opt_different_sized_ops=true
                 --xla_tpu_use_minor_sharding_for_major_trivial_input=true
@@ -91,6 +86,9 @@ spec:
                 --xla_tpu_host_transfer_overlap_limit=24
                 --xla_max_concurrent_host_send_recv=100
                 --xla_tpu_scheduler_percent_shared_memory_limit=60
+                --xla_tpu_use_enhanced_launch_barrier=false
+                --slicebuilder_use_insecure_grpc=true
+                --undefok=slicebuilder_use_insecure_grpc
           resources:
             requests:
               google.com/tpu: 4
