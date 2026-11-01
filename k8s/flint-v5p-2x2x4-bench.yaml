@@ -1,0 +1,181 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: flint-v5p-jax-bench-svc
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    job-name: flint-v5p-jax-bench
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flint-v5p-jax-bench
+  namespace: default
+  labels:
+    app: flint-v5p-jax-bench
+spec:
+  backoffLimit: 8
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        app: flint-v5p-jax-bench
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      serviceAccountName: default
+      subdomain: flint-v5p-jax-bench-svc
+      restartPolicy: OnFailure
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v5p-16-pool
+        cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+        cloud.google.com/gke-tpu-topology: 2x2x4
+      tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "cloud.google.com/gke-spot"
+          operator: "Exists"
+          effect: "NoSchedule"
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: scratch
+          emptyDir: {}
+      containers:
+        - name: jax-tpu-trainer
+          image: us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/maxtext/maxtext:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: JAX_PLATFORMS
+              value: "tpu,cpu"
+            - name: ENABLE_PJRT_COMPATIBILITY
+              value: "true"
+            - name: GCS_BUCKET_ROOT
+              value: "gs://YOUR_GCS_BUCKET/flint-jax-training"
+            - name: LIBTPU_INIT_ARGS
+              value: >-
+                --xla_tpu_scoped_vmem_limit_kib=81920
+                --xla_tpu_overlap_compute_collective_tc=true
+                --xla_enable_async_all_gather=true
+                --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                --xla_tpu_data_parallel_opt_different_sized_ops=true
+                --xla_tpu_use_minor_sharding_for_major_trivial_input=true
+                --xla_tpu_relayout_group_size_threshold_for_reduce_scatter=1
+                --xla_tpu_assign_all_reduce_scatter_layout=true
+                --xla_tpu_enable_scheduler_memory_pressure_tracking=true
+                --xla_tpu_host_transfer_overlap_limit=24
+                --xla_max_concurrent_host_send_recv=100
+                --xla_tpu_scheduler_percent_shared_memory_limit=60
+          resources:
+            requests:
+              google.com/tpu: "4"
+            limits:
+              google.com/tpu: "4"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: scratch
+              mountPath: /scratch
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+              echo "=== JAX Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
+              mkdir -p /scratch/flint-jax-training /scratch/results
+              python3 - <<'PY'
+              import json, os, pathlib, urllib.parse, urllib.request
+              req = urllib.request.Request(
+                  "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+                  headers={"Metadata-Flavor": "Google"},
+              )
+              tok = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())["access_token"]
+              bucket = "YOUR_GCS_BUCKET"
+              files = [
+                  "flint_jax/__init__.py",
+                  "flint_jax/config.py",
+                  "flint_jax/model.py",
+                  "flint_jax/checkpoint_loader.py",
+                  "flint_jax/train.py",
+              ]
+              for fn in files:
+                  obj = urllib.parse.quote(f"flint-jax-training/{fn}", safe="")
+                  r = urllib.request.Request(
+                      f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{obj}?alt=media",
+                      headers={"Authorization": f"Bearer {tok}"},
+                  )
+                  dst = pathlib.Path("/scratch/flint-jax-training") / fn
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  dst.write_bytes(urllib.request.urlopen(r, timeout=30).read())
+              # Also download config.json from staged HF model in GCS
+              cfg_obj = urllib.parse.quote("models/RecursiveSI/flint/config.json", safe="")
+              r_cfg = urllib.request.Request(
+                  f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{cfg_obj}?alt=media",
+                  headers={"Authorization": f"Bearer {tok}"},
+              )
+              pathlib.Path("/scratch/flint-jax-training/config.json").write_bytes(
+                  urllib.request.urlopen(r_cfg, timeout=30).read()
+              )
+              print("Downloaded flint_jax + config.json from GCS!", flush=True)
+              PY
+
+              export PYTHONPATH="/scratch/flint-jax-training:${PYTHONPATH:-}"
+
+              run_exp() {
+                local name="$1"
+                local seq="$2"
+                local mb="$3"
+                local fsdp="$4"
+                local ep="$5"
+                echo "=== [EXP] ${name}: seq=${seq} mb=${mb} fsdp=${fsdp} ep=${ep} ==="
+                set +e
+                python3 -u -m flint_jax.train \
+                  --config-json=/scratch/flint-jax-training/config.json \
+                  --seq-len="${seq}" \
+                  --per-device-batch-size="${mb}" \
+                  --data-parallel=1 \
+                  --fsdp-parallel="${fsdp}" \
+                  --expert-parallel="${ep}" \
+                  --tensor-parallel=1 \
+                  --steps=12 \
+                  --summary-json="/scratch/results/${name}.json" 2>&1 | tee "/scratch/results/${name}_w${JOB_COMPLETION_INDEX}.log"
+                local rc=${PIPESTATUS[0]}
+                set -e
+                echo "=== [EXP DONE] ${name} rc=${rc} ==="
+                if [ "${JOB_COMPLETION_INDEX}" = "0" ]; then
+                  python3 - "${name}" <<'UP'
+              import json, pathlib, sys, urllib.parse, urllib.request
+              name = sys.argv[1]
+              req = urllib.request.Request(
+                  "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+                  headers={"Metadata-Flavor": "Google"},
+              )
+              tok = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())["access_token"]
+              bucket = "YOUR_GCS_BUCKET"
+              for p in pathlib.Path("/scratch/results").glob(f"{name}*"):
+                  obj = urllib.parse.quote(f"flint-jax-training/results/{p.name}", safe="")
+                  r = urllib.request.Request(
+                      f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o?uploadType=media&name={obj}",
+                      data=p.read_bytes(),
+                      method="POST",
+                      headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/octet-stream"},
+                  )
+                  urllib.request.urlopen(r, timeout=30).read()
+              print(f"Uploaded {name} results to GCS!", flush=True)
+              UP
+                fi
+                sleep 3
+              }
+
+              run_exp "jax_v5p16_fsdp4_ep4_s2048_mb2" 2048 2 4 4
+              run_exp "jax_v5p16_fsdp4_ep4_s2048_mb4" 2048 4 4 4
+              run_exp "jax_v5p16_fsdp16_ep1_s2048_mb4" 2048 4 16 1
+              run_exp "jax_v5p16_fsdp4_ep4_s4096_mb2" 4096 2 4 4
+              echo "=== ALL JAX TPU v5p-16 BENCHMARKS COMPLETE ==="

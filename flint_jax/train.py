@@ -99,7 +99,7 @@ def create_sharded_train_state(
     seq_len: int,
 ) -> tuple[train_state.TrainState, Any]:
     """Initializes and shards Flint's parameters and AdamW optimizer state directly across TPU HBM."""
-    dummy_tokens = jnp.ones((jax.device_count(), seq_len), dtype=jnp.int32)
+    num_devs = jax.device_count()
     token_sharding = NamedSharding(mesh, P(("data", "fsdp", "expert"), None))
 
     def init_fn(key: jax.Array, tokens: jnp.ndarray) -> train_state.TrainState:
@@ -111,6 +111,10 @@ def create_sharded_train_state(
         )
 
     with jax.set_mesh(mesh):
+        dummy_tokens = jax.jit(
+            lambda: jnp.ones((num_devs, seq_len), dtype=jnp.int32),
+            out_shardings=token_sharding,
+        )()
         abstract_Vars = jax.eval_shape(init_fn, rng, dummy_tokens)
         state_sharding = nn.get_sharding(abstract_Vars, mesh)
         sharded_init = jax.jit(
@@ -118,7 +122,7 @@ def create_sharded_train_state(
             in_shardings=(NamedSharding(mesh, P()), token_sharding),
             out_shardings=state_sharding,
         )
-        state = sharded_init(rng, jax.device_put(dummy_tokens, token_sharding))
+        state = sharded_init(rng, dummy_tokens)
     return state, state_sharding
 
 
@@ -167,6 +171,7 @@ def main() -> None:
     parser.add_argument("--expert-parallel", type=int, default=4)
     parser.add_argument("--tensor-parallel", type=int, default=1)
     parser.add_argument("--num-layers-override", type=int, default=None, help="Optional layer count override for fast smoke test")
+    parser.add_argument("--summary-json", type=str, default=None, help="Optional path to write JSON benchmark summary")
     args = parser.parse_args()
 
     # Initialize multi-host / multi-slice JAX runtime on GKE TPU
@@ -315,8 +320,30 @@ def main() -> None:
         loaded_params = load_hf_flint_checkpoint(args.hf_checkpoint_dir, state.params, config)
         state = state.replace(params=loaded_params)
 
-    global_batch_size = args.per_device_batch_size * jax.device_count()
+    num_devs = jax.device_count()
+    global_batch_size = args.per_device_batch_size * num_devs
     batch_sharding = NamedSharding(mesh, P(("data", "fsdp", "expert"), None))
+
+    def _make_batch(step_idx: jnp.ndarray) -> dict[str, jnp.ndarray]:
+        step_rng = jax.random.fold_in(rng, step_idx)
+        tokens = jax.random.randint(
+            step_rng,
+            shape=(global_batch_size, args.seq_len),
+            minval=0,
+            maxval=config.vocab_size,
+            dtype=jnp.int32,
+        )
+        return {
+            "input_ids": tokens,
+            "labels": tokens,
+            "loss_mask": jnp.ones_like(tokens, dtype=jnp.int32),
+        }
+
+    compiled_make_batch = jax.jit(
+        _make_batch,
+        in_shardings=(NamedSharding(mesh, P()),),
+        out_shardings=batch_sharding,
+    )
 
     compiled_train_step = jax.jit(
         functools.partial(train_step, vocab_size=config.vocab_size),
@@ -325,40 +352,85 @@ def main() -> None:
         donate_argnums=(0,),
     )
 
+    # Active FLOPs/token for RecursiveSI/flint (17.385 GFLOP/tok @ seq_len=2048)
+    flops_per_token = 17.385e9
+    peak_tflops_per_chip = 459.0
+    step_records: list[dict[str, Any]] = []
+
     with jax.set_mesh(mesh):
         for step in range(1, args.steps + 1):
+            batch = compiled_make_batch(jnp.asarray(step, dtype=jnp.int32))
+            jax.block_until_ready(batch["input_ids"])
             step_t0 = time.perf_counter()
-            step_rng = jax.random.fold_in(rng, step)
-            tokens = jax.random.randint(
-                step_rng,
-                shape=(global_batch_size, args.seq_len),
-                minval=0,
-                maxval=config.vocab_size,
-                dtype=jnp.int32,
-            )
-            batch = {
-                "input_ids": jax.device_put(tokens, batch_sharding),
-                "labels": jax.device_put(tokens, batch_sharding),
-                "loss_mask": jax.device_put(jnp.ones_like(tokens, dtype=jnp.int32), batch_sharding),
-            }
 
             state, metrics = compiled_train_step(state, batch)
             jax.block_until_ready(metrics["total_loss"])
             dt = time.perf_counter() - step_t0
             tokens_per_sec = (global_batch_size * args.seq_len) / dt
+            tps_per_chip = tokens_per_sec / num_devs
+            mfu_pct = (tps_per_chip * flops_per_token) / (peak_tflops_per_chip * 1e12) * 100.0
+            mem_stats = jax.local_devices()[0].memory_stats() or {}
+            peak_hbm_gib = mem_stats.get("peak_bytes_in_use", 0) / (1024 ** 3)
+
+            rec = {
+                "step": step,
+                "total_loss": round(float(metrics["total_loss"]), 5),
+                "lm_loss": round(float(metrics["lm_loss"]), 5),
+                "moe_aux_loss": round(float(metrics["moe_aux_loss"]), 6),
+                "grad_norm": round(float(metrics["grad_norm"]), 4),
+                "step_time_s": round(dt, 4),
+                "cluster_tok_s": round(tokens_per_sec, 1),
+                "chip_tok_s": round(tps_per_chip, 1),
+                "mfu_pct": round(mfu_pct, 2),
+                "peak_hbm_gib": round(peak_hbm_gib, 2),
+            }
+            step_records.append(rec)
 
             if jax.process_index() == 0:
                 logger.info(
-                    "Step %04d/%04d | total_loss=%.4f | lm_loss=%.4f | moe_aux_loss=%.4f | grad_norm=%.4f | step_time=%.3fs | tok/s=%.1f",
+                    "Step %04d/%04d | loss=%.4f (lm=%.4f aux=%.5f) | gnorm=%.4f | dt=%.3fs | chip_tps=%.1f | slice_tps=%.1f | MFU=%.2f%% | HBM=%.2fGiB",
                     step,
                     args.steps,
-                    float(metrics["total_loss"]),
-                    float(metrics["lm_loss"]),
-                    float(metrics["moe_aux_loss"]),
-                    float(metrics["grad_norm"]),
+                    rec["total_loss"],
+                    rec["lm_loss"],
+                    rec["moe_aux_loss"],
+                    rec["grad_norm"],
                     dt,
+                    tps_per_chip,
                     tokens_per_sec,
+                    mfu_pct,
+                    peak_hbm_gib,
                 )
+
+    if jax.process_index() == 0 and args.summary_json:
+        import json as _json
+        import statistics as _stats
+        steady = step_records[min(3, len(step_records) - 1) :]
+        summary = {
+            "device_kind": jax.devices()[0].device_kind,
+            "num_devices": num_devs,
+            "seq_len": args.seq_len,
+            "per_device_batch_size": args.per_device_batch_size,
+            "tokens_per_step": global_batch_size * args.seq_len,
+            "mesh": {
+                "data": args.data_parallel,
+                "fsdp": args.fsdp_parallel,
+                "expert": args.expert_parallel,
+                "tensor": args.tensor_parallel,
+            },
+            "steady_chip_tok_s": round(_stats.median([r["chip_tok_s"] for r in steady]), 1),
+            "steady_cluster_tok_s": round(_stats.median([r["cluster_tok_s"] for r in steady]), 1),
+            "steady_mfu_pct": round(_stats.median([r["mfu_pct"] for r in steady]), 2),
+            "peak_mfu_pct": round(max(r["mfu_pct"] for r in steady), 2),
+            "peak_hbm_gib": round(max(r["peak_hbm_gib"] for r in step_records), 2),
+            "loss_start": step_records[0]["lm_loss"],
+            "loss_end": step_records[-1]["lm_loss"],
+            "steps": step_records,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.summary_json)), exist_ok=True)
+        with open(args.summary_json, "w") as f:
+            _json.dump(summary, f, indent=2)
+        logger.info("Wrote JAX benchmark summary to %s: steady MFU=%.2f%% (peak %.2f%%), HBM=%.2fGiB", args.summary_json, summary["steady_mfu_pct"], summary["peak_mfu_pct"], summary["peak_hbm_gib"])
 
 
 if __name__ == "__main__":
