@@ -117,7 +117,11 @@ class FlintJAXConfig:
     dtype: Any = jnp.bfloat16
     weight_dtype: Any = jnp.bfloat16
     use_ragged_dot_moe: bool = True
+    use_splash_attention: bool = True
+    splash_block_size: int = 512
     remat_layers: bool = True
+    remat_first_n_layers: int = 49
+    ce_chunk_tokens: int = 256
 
     def is_dense_layer(self, layer_id: int) -> bool:
         return layer_id in self.mlp_only_layers

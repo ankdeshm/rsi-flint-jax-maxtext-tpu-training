@@ -1,17 +1,11 @@
 """Distributed JAX BF16 Pre-Training / Continual Pre-Training Script for Recursive Flint on TPU v5p.
 
-Designed for the `tpu-v5p-16-pool` node pool (`2x2x4` topology = 4 nodes, 16 TPU v5p chips,
-1,520 GB HBM) in cluster `tpu-v5p-cluster` (`YOUR_GCP_PROJECT_ID`), and also supports single-host
-`2x2x1` smoke testing or larger multi-slice `JobSet` topologies.
-
-Features:
-  - Automatic multi-host TPU initialization (`jax.distributed.initialize()`)
-  - 4D SPMD Mesh (`data`, `fsdp`, `expert`, `tensor`) across TPU v5p devices
-  - Full BF16 forward/backward pass with FP32 master weights & AdamW optimizer states sharded across
-    `fsdp` and `expert` axes
-  - Optional loading of pretrained `RecursiveSI/flint` safetensors checkpoint
-  - Async Orbax checkpointing to GCS (`gs://YOUR_GCP_PROJECT_ID-maxtext/flint-jax-checkpoints`)
-    for Spot TPU preemption recovery
+Supports both baseline (`--sweep-v5p16`) and high-MFU optimized (`--sweep-v5p16-opt`) sweeps across
+4-host TPU v5p slices (`2x2x4`, 16 chips) with:
+  - Native TPU Pallas `SplashAttention` (`sinks=softmax_offset`, block-sparse `LocalMask(512, 0)`)
+  - Fused `W_gate_up` `jax.lax.ragged_dot` (zero token ICI under `FSDP=16, EP=1` or compacted `EP>1`)
+  - Overlapped async FSDP weight `all-gather` / gradient `reduce-scatter` across all 49 layers
+  - Chunked `@jax.checkpoint` `jax.lax.scan` Cross-Entropy & `jax.lax.scan` Gradient Accumulation
 """
 
 from __future__ import annotations
@@ -55,7 +49,6 @@ def _wait_for_gke_tpu_worker_dns() -> None:
 _wait_for_gke_tpu_worker_dns()
 
 import flax.linen as nn
-from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
 import jax
 import jax.numpy as jnp
@@ -146,8 +139,8 @@ def create_sharded_train_state(
             lambda: jnp.ones((num_devs, seq_len), dtype=jnp.int32),
             out_shardings=token_sharding,
         )()
-        abstract_Vars = jax.eval_shape(init_fn, rng, dummy_tokens)
-        state_sharding = nn.get_sharding(abstract_Vars, mesh)
+        abstract_vars = jax.eval_shape(init_fn, rng, dummy_tokens)
+        state_sharding = nn.get_sharding(abstract_vars, mesh)
         sharded_init = jax.jit(
             init_fn,
             in_shardings=(NamedSharding(mesh, P()), token_sharding),
@@ -160,24 +153,63 @@ def create_sharded_train_state(
 def train_step(
     state: train_state.TrainState,
     batch: dict[str, jnp.ndarray],
-    vocab_size: int,
+    grad_accum_steps: int = 1,
 ) -> tuple[train_state.TrainState, dict[str, jnp.ndarray]]:
-    """Single compiled SPMD training step in BF16 with causal LM cross-entropy + MoE aux loss."""
+    """Compiled SPMD training step in BF16 with chunked LM cross-entropy + scan gradient accumulation."""
 
-    def loss_fn(params: Any) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-        logits, aux_loss = state.apply_fn({"params": params}, batch["input_ids"])
-        # Shift for next-token prediction
-        shift_logits = logits[:, :-1, :].astype(jnp.float32)
-        shift_labels = batch["labels"][:, 1:]
-        loss_mask = batch["loss_mask"][:, 1:].astype(jnp.float32)
-
-        token_losses = optax.softmax_cross_entropy_with_integer_labels(shift_logits, shift_labels)
-        lm_loss = jnp.sum(token_losses * loss_mask) / jnp.maximum(jnp.sum(loss_mask), 1.0)
+    def micro_loss_fn(
+        params: Any,
+        input_ids: jnp.ndarray,
+        labels: jnp.ndarray,
+        loss_mask: jnp.ndarray,
+    ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+        lm_loss, aux_loss = state.apply_fn(
+            {"params": params},
+            input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
         total_loss = lm_loss + aux_loss
-        return total_loss, {"total_loss": total_loss, "lm_loss": lm_loss, "moe_aux_loss": aux_loss}
+        return total_loss, {
+            "total_loss": total_loss,
+            "lm_loss": lm_loss,
+            "moe_aux_loss": aux_loss,
+        }
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (_, metrics), grads = grad_fn(state.params)
+    grad_fn = jax.value_and_grad(micro_loss_fn, has_aux=True)
+
+    if grad_accum_steps <= 1:
+        (_, metrics), grads = grad_fn(
+            state.params,
+            batch["input_ids"],
+            batch["labels"],
+            batch["loss_mask"],
+        )
+    else:
+        zero_grads = jax.tree_util.tree_map(jnp.zeros_like, state.params)
+        zero_metrics = {
+            "total_loss": jnp.array(0.0, dtype=jnp.float32),
+            "lm_loss": jnp.array(0.0, dtype=jnp.float32),
+            "moe_aux_loss": jnp.array(0.0, dtype=jnp.float32),
+        }
+
+        def _accum_body(carry, micro_batch):
+            acc_g, acc_m = carry
+            in_ids, lbls, msk = micro_batch
+            (_, m_step), g_step = grad_fn(state.params, in_ids, lbls, msk)
+            new_g = jax.tree_util.tree_map(lambda a, b: a + b, acc_g, g_step)
+            new_m = {k: acc_m[k] + m_step[k] for k in acc_m}
+            return (new_g, new_m), None
+
+        (sum_grads, sum_metrics), _ = jax.lax.scan(
+            _accum_body,
+            (zero_grads, zero_metrics),
+            (batch["input_ids"], batch["labels"], batch["loss_mask"]),
+        )
+        inv_ga = 1.0 / float(grad_accum_steps)
+        grads = jax.tree_util.tree_map(lambda g: (g * inv_ga).astype(g.dtype), sum_grads)
+        metrics = {k: v * inv_ga for k, v in sum_metrics.items()}
+
     grad_norm = optax.global_norm(grads)
     metrics["grad_norm"] = grad_norm
     new_state = state.apply_gradients(grads=grads)
@@ -208,7 +240,11 @@ def compute_active_flops_per_token(config: FlintJAXConfig, seq_len: int) -> floa
     return 6.0 * n_active + attn_flops
 
 
-def _upload_file_to_gcs(local_path: str, gcs_object_name: str, bucket: str = "YOUR_GCS_BUCKET") -> None:
+def _upload_file_to_gcs(
+    local_path: str,
+    gcs_object_name: str,
+    bucket: str = "YOUR_GCS_BUCKET",
+) -> None:
     """Uploads a local file to GCS via GCE metadata token without external CLI dependencies."""
     import json as _json
     import pathlib as _pathlib
@@ -241,6 +277,7 @@ def run_single_experiment(
     config: FlintJAXConfig,
     seq_len: int,
     per_device_batch_size: int,
+    grad_accum_steps: int = 1,
     steps: int,
     learning_rate: float,
     warmup_steps: int,
@@ -257,22 +294,27 @@ def run_single_experiment(
     """Runs one full SPMD compile + training benchmark inside an active JAX session."""
     import gc
     import json as _json
+    import math as _math
     import statistics as _stats
     from jax.experimental import multihost_utils
 
     num_devs = jax.device_count()
-    global_batch_size = per_device_batch_size * num_devs
+    micro_global_bs = per_device_batch_size * num_devs
+    tokens_per_step = micro_global_bs * seq_len * grad_accum_steps
     flops_per_token = compute_active_flops_per_token(config, seq_len)
     dev_kind = jax.devices()[0].device_kind
-    peak_tflops_per_chip = 459.0 if "v5p" in dev_kind.lower() or "v5" in dev_kind.lower() else 1153.5
+    peak_tflops_per_chip = (
+        459.0 if "v5p" in dev_kind.lower() or "v5" in dev_kind.lower() else 1153.5
+    )
 
     logger.info(
-        "=== [%s] START: seq=%d, mb=%d (global_bs=%d, tok/step=%d), mesh=(dp=%d, fsdp=%d, ep=%d, tp=%d), flops/tok=%.3fG ===",
+        "=== [%s] START: seq=%d, mb=%d, ga=%d (tok/step=%d), remat_n=%d, mesh=(dp=%d, fsdp=%d, ep=%d, tp=%d), flops/tok=%.3fG ===",
         exp_name,
         seq_len,
         per_device_batch_size,
-        global_batch_size,
-        global_batch_size * seq_len,
+        grad_accum_steps,
+        tokens_per_step,
+        config.remat_first_n_layers if config.remat_layers else 0,
         data_parallel,
         fsdp_parallel,
         expert_parallel,
@@ -286,7 +328,7 @@ def run_single_experiment(
         expert_parallel=expert_parallel,
         tensor_parallel=tensor_parallel,
     )
-    model = FlintForCausalLM(config=config)
+    model = FlintForCausalLM(config=config, mesh=mesh)
     tx = build_optimizer(
         learning_rate=learning_rate,
         warmup_steps=warmup_steps,
@@ -315,17 +357,27 @@ def run_single_experiment(
         logger.info("[%s] Initialized sharded TrainState in %.2fs", exp_name, init_time_s)
 
         if hf_checkpoint_dir:
-            logger.info("[%s] Loading pretrained RecursiveSI/flint BF16 weights from %s ...", exp_name, hf_checkpoint_dir)
+            logger.info(
+                "[%s] Loading pretrained RecursiveSI/flint BF16 weights from %s ...",
+                exp_name,
+                hf_checkpoint_dir,
+            )
             loaded_params = load_hf_flint_checkpoint(hf_checkpoint_dir, state.params, config)
             state = state.replace(params=loaded_params)
 
-        batch_sharding = NamedSharding(mesh, P(("data", "fsdp", "expert"), None))
+        if grad_accum_steps <= 1:
+            batch_sharding = NamedSharding(mesh, P(("data", "fsdp", "expert"), None))
+            batch_shape = (micro_global_bs, seq_len)
+        else:
+            batch_sharding = NamedSharding(mesh, P(None, ("data", "fsdp", "expert"), None))
+            batch_shape = (grad_accum_steps, micro_global_bs, seq_len)
 
         def _make_batch(step_idx: jnp.ndarray) -> dict[str, jnp.ndarray]:
-            step_rng = jax.random.fold_in(rng, step_idx)
+            # Cycle over 2 synthetic mini-corpus batches so loss convergence is directly observable
+            step_rng = jax.random.fold_in(rng, step_idx % 2)
             tokens = jax.random.randint(
                 step_rng,
-                shape=(global_batch_size, seq_len),
+                shape=batch_shape,
                 minval=0,
                 maxval=config.vocab_size,
                 dtype=jnp.int32,
@@ -343,7 +395,7 @@ def run_single_experiment(
         )
 
         compiled_train_step = jax.jit(
-            functools.partial(train_step, vocab_size=config.vocab_size),
+            functools.partial(train_step, grad_accum_steps=grad_accum_steps),
             in_shardings=(state_sharding, batch_sharding),
             out_shardings=(state_sharding, NamedSharding(mesh, P())),
             donate_argnums=(0,),
@@ -358,7 +410,7 @@ def run_single_experiment(
                 state, metrics = compiled_train_step(state, batch)
                 jax.block_until_ready(metrics["total_loss"])
                 dt = time.perf_counter() - step_t0
-                tokens_per_sec = (global_batch_size * seq_len) / dt
+                tokens_per_sec = tokens_per_step / dt
                 tps_per_chip = tokens_per_sec / num_devs
                 mfu_pct = (tps_per_chip * flops_per_token) / (peak_tflops_per_chip * 1e12) * 100.0
                 mem_stats = jax.local_devices()[0].memory_stats() or {}
@@ -399,14 +451,20 @@ def run_single_experiment(
                     )
 
         steady = step_records[min(3, len(step_records) - 1) :]
-        summary: dict[str, Any] = {
+        has_nan = any(
+            _math.isnan(r["lm_loss"]) or _math.isnan(r["grad_norm"]) for r in step_records
+        )
+        summary = {
             "exp_name": exp_name,
-            "status": "PASS",
+            "status": "PASS_WITH_NAN" if has_nan else "PASS",
             "device_kind": dev_kind,
             "num_devices": num_devs,
             "seq_len": seq_len,
             "per_device_batch_size": per_device_batch_size,
-            "tokens_per_step": global_batch_size * seq_len,
+            "grad_accum_steps": grad_accum_steps,
+            "remat_first_n_layers": config.remat_first_n_layers if config.remat_layers else 0,
+            "use_splash_attention": config.use_splash_attention,
+            "tokens_per_step": tokens_per_step,
             "flops_per_token_g": round(flops_per_token / 1e9, 4),
             "peak_tflops_per_chip": peak_tflops_per_chip,
             "mesh": {
@@ -431,13 +489,18 @@ def run_single_experiment(
         logger.error("[%s] FAILED with %s: %s", exp_name, type(exc).__name__, exc)
         summary = {
             "exp_name": exp_name,
-            "status": "OOM" if "RESOURCE_EXHAUSTED" in str(exc) or "Out of memory" in str(exc) else "FAIL",
+            "status": (
+                "OOM"
+                if "RESOURCE_EXHAUSTED" in str(exc) or "Out of memory" in str(exc)
+                else "FAIL"
+            ),
             "error": f"{type(exc).__name__}: {str(exc)[:600]}",
             "device_kind": dev_kind,
             "num_devices": num_devs,
             "seq_len": seq_len,
             "per_device_batch_size": per_device_batch_size,
-            "tokens_per_step": global_batch_size * seq_len,
+            "grad_accum_steps": grad_accum_steps,
+            "tokens_per_step": tokens_per_step,
             "mesh": {
                 "data": data_parallel,
                 "fsdp": fsdp_parallel,
@@ -459,47 +522,46 @@ def run_single_experiment(
             _json.dump(summary, f, indent=2)
         logger.info("[%s] Wrote summary to %s (status=%s)", exp_name, summary_json, summary["status"])
         if gcs_results_prefix:
-            _upload_file_to_gcs(summary_json, f"{gcs_results_prefix.rstrip('/')}/{os.path.basename(summary_json)}")
+            _upload_file_to_gcs(
+                summary_json, f"{gcs_results_prefix.rstrip('/')}/{os.path.basename(summary_json)}"
+            )
 
     return summary
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train Recursive Flint (39.8B MoE) in BF16 with JAX on TPU v5p")
+    parser = argparse.ArgumentParser(
+        description="Train Recursive Flint (39.8B MoE) in BF16 with JAX on TPU v5p"
+    )
     parser.add_argument("--config-json", type=str, default=None, help="Path to RecursiveSI/flint config.json")
     parser.add_argument("--hf-checkpoint-dir", type=str, default=None, help="Optional local path to RecursiveSI/flint safetensors")
     parser.add_argument("--output-dir", type=str, default=os.environ.get("BASE_OUTPUT_DIR", "gs://YOUR_GCS_BUCKET/flint-jax-training/checkpoints"))
-    parser.add_argument("--seq-len", type=int, default=4096, help="Training sequence length (Flint supports up to 262144)")
-    parser.add_argument("--per-device-batch-size", type=int, default=1, help="Micro-batch size per TPU chip")
-    parser.add_argument("--steps", type=int, default=100, help="Total training steps")
+    parser.add_argument("--seq-len", type=int, default=2048, help="Training sequence length (Flint supports up to 262144)")
+    parser.add_argument("--per-device-batch-size", type=int, default=16, help="Micro-batch size per TPU chip")
+    parser.add_argument("--grad-accum-steps", type=int, default=2, help="Gradient accumulation microbatches per optimizer step")
+    parser.add_argument("--remat-first-n-layers", type=int, default=49, help="Number of leading layers to activation-checkpoint (49 = full remat)")
+    parser.add_argument("--steps", type=int, default=12, help="Total training steps")
     parser.add_argument("--learning-rate", type=float, default=1.5e-4)
-    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
-    # Mesh axes for 2x2x4 (16 TPU v5p chips): data=1, fsdp=4, expert=4, tensor=1
     parser.add_argument("--data-parallel", type=int, default=1)
-    parser.add_argument("--fsdp-parallel", type=int, default=4)
-    parser.add_argument("--expert-parallel", type=int, default=4)
+    parser.add_argument("--fsdp-parallel", type=int, default=16)
+    parser.add_argument("--expert-parallel", type=int, default=1)
     parser.add_argument("--tensor-parallel", type=int, default=1)
     parser.add_argument("--num-layers-override", type=int, default=None, help="Optional layer count override for fast smoke test")
     parser.add_argument("--summary-json", type=str, default=None, help="Optional path to write JSON benchmark summary")
-    parser.add_argument("--sweep-v5p16", action="store_true", help="Run full single-process 2x2x4 (16-chip TPU v5p) SPMD mesh sweep")
+    parser.add_argument("--sweep-v5p16", action="store_true", help="Run baseline 6-config 2x2x4 SPMD mesh sweep")
+    parser.add_argument("--sweep-v5p16-opt", action="store_true", help="Run optimized high-MFU SplashAttention + fused ragged_dot hillclimb sweep on 2x2x4 TPU v5p")
     parser.add_argument("--sweep-output-dir", type=str, default="/scratch/results", help="Local directory for sweep JSON outputs")
     parser.add_argument("--gcs-results-prefix", type=str, default="flint-jax-training/results", help="GCS prefix for immediate result upload")
     args = parser.parse_args()
 
-    # Initialize multi-host / multi-slice JAX runtime on GKE TPU ONCE per pod
     try:
         coord_addr = os.environ.get("MEGASCALE_COORDINATOR_ADDRESS")
         num_slices = os.environ.get("MEGASCALE_NUM_SLICES")
         slice_id = os.environ.get("MEGASCALE_SLICE_ID", os.environ.get("JOB_COMPLETION_INDEX"))
         if coord_addr and num_slices and slice_id is not None and int(num_slices) > 1:
-            logger.info(
-                "Initializing multi-slice JAX runtime: coordinator=%s, num_processes=%s, process_id=%s",
-                coord_addr,
-                num_slices,
-                slice_id,
-            )
             jax.distributed.initialize(
                 coordinator_address=coord_addr,
                 num_processes=int(num_slices),
@@ -544,39 +606,58 @@ def main() -> None:
         jax.devices()[0].device_kind,
     )
 
-    overrides: dict[str, Any] = {
+    base_overrides: dict[str, Any] = {
         "dtype": jnp.bfloat16,
         "weight_dtype": jnp.bfloat16,
+        "remat_first_n_layers": args.remat_first_n_layers,
     }
     if args.num_layers_override is not None:
-        overrides["num_hidden_layers"] = args.num_layers_override
-        overrides["layer_types"] = FlintJAXConfig.layer_types[: args.num_layers_override]
+        base_overrides["num_hidden_layers"] = args.num_layers_override
+        base_overrides["layer_types"] = FlintJAXConfig.layer_types[: args.num_layers_override]
 
-    if args.config_json:
-        config = FlintJAXConfig.from_json_file(args.config_json, **overrides)
-    else:
-        config = FlintJAXConfig(**overrides)
+    def _build_cfg(**extra: Any) -> FlintJAXConfig:
+        merged = {**base_overrides, **extra}
+        if args.config_json:
+            return FlintJAXConfig.from_json_file(args.config_json, **merged)
+        return FlintJAXConfig(**merged)
 
-    if args.sweep_v5p16:
+    if args.sweep_v5p16 or args.sweep_v5p16_opt:
         import json as _json
 
-        sweep_specs = [
-            # (exp_name, seq_len, mb, dp, fsdp, ep, tp)
-            ("jax_v5p16_fsdp4_ep4_s2048_mb2", 2048, 2, 1, 4, 4, 1),
-            ("jax_v5p16_fsdp4_ep4_s2048_mb4", 2048, 4, 1, 4, 4, 1),
-            ("jax_v5p16_fsdp8_ep2_s2048_mb4", 2048, 4, 1, 8, 2, 1),
-            ("jax_v5p16_fsdp16_ep1_s2048_mb4", 2048, 4, 1, 16, 1, 1),
-            ("jax_v5p16_fsdp4_ep4_s4096_mb2", 4096, 2, 1, 4, 4, 1),
-            ("jax_v5p16_fsdp4_ep4_s4096_mb4", 4096, 4, 1, 4, 4, 1),
-        ]
+        if args.sweep_v5p16_opt:
+            # (exp_name, seq_len, mb, ga, remat_n, dp, fsdp, ep, tp)
+            sweep_specs = [
+                ("jax_opt01_fsdp16_ep1_s2048_mb8_ga1", 2048, 8, 1, 49, 1, 16, 1, 1),
+                ("jax_opt02_fsdp16_ep1_s2048_mb16_ga2", 2048, 16, 2, 49, 1, 16, 1, 1),
+                ("jax_opt03_fsdp16_ep1_s2048_mb24_ga2", 2048, 24, 2, 49, 1, 16, 1, 1),
+                ("jax_opt04_fsdp16_ep1_s2048_mb32_ga2", 2048, 32, 2, 49, 1, 16, 1, 1),
+                ("jax_opt05_fsdp16_ep1_s2048_mb32_ga4_hybac32", 2048, 32, 4, 32, 1, 16, 1, 1),
+                ("jax_opt06_fsdp16_ep1_s2048_mb48_ga2", 2048, 48, 2, 49, 1, 16, 1, 1),
+                ("jax_opt07_fsdp4_ep4_s2048_mb16_ga2", 2048, 16, 2, 49, 1, 4, 4, 1),
+                ("jax_opt08_fsdp16_ep1_s4096_mb16_ga2", 4096, 16, 2, 49, 1, 16, 1, 1),
+            ]
+            summary_filename = "jax_v5p16_opt_sweep_summary.json"
+        else:
+            sweep_specs = [
+                ("jax_v5p16_fsdp4_ep4_s2048_mb2", 2048, 2, 1, 49, 1, 4, 4, 1),
+                ("jax_v5p16_fsdp4_ep4_s2048_mb4", 2048, 4, 1, 49, 1, 4, 4, 1),
+                ("jax_v5p16_fsdp8_ep2_s2048_mb4", 2048, 4, 1, 49, 1, 8, 2, 1),
+                ("jax_v5p16_fsdp16_ep1_s2048_mb4", 2048, 4, 1, 49, 1, 16, 1, 1),
+                ("jax_v5p16_fsdp4_ep4_s4096_mb2", 4096, 2, 1, 49, 1, 4, 4, 1),
+                ("jax_v5p16_fsdp4_ep4_s4096_mb4", 4096, 4, 1, 49, 1, 4, 4, 1),
+            ]
+            summary_filename = "jax_v5p16_sweep_summary.json"
+
         all_results: list[dict[str, Any]] = []
-        for exp_name, seq_len, mb, dp, fsdp, ep, tp in sweep_specs:
+        for exp_name, seq_len, mb, ga, remat_n, dp, fsdp, ep, tp in sweep_specs:
+            cfg = _build_cfg(remat_first_n_layers=remat_n)
             out_json = os.path.join(args.sweep_output_dir, f"{exp_name}.json")
             res = run_single_experiment(
                 exp_name=exp_name,
-                config=config,
+                config=cfg,
                 seq_len=seq_len,
                 per_device_batch_size=mb,
+                grad_accum_steps=ga,
                 steps=args.steps,
                 learning_rate=args.learning_rate,
                 warmup_steps=min(args.warmup_steps, max(1, args.steps // 3)),
@@ -593,17 +674,23 @@ def main() -> None:
             all_results.append(res)
 
         if jax.process_index() == 0:
-            combined_path = os.path.join(args.sweep_output_dir, "jax_v5p16_sweep_summary.json")
+            combined_path = os.path.join(args.sweep_output_dir, summary_filename)
             with open(combined_path, "w") as f:
                 _json.dump({"experiments": all_results}, f, indent=2)
-            _upload_file_to_gcs(combined_path, f"{args.gcs_results_prefix.rstrip('/')}/jax_v5p16_sweep_summary.json")
+            _upload_file_to_gcs(
+                combined_path, f"{args.gcs_results_prefix.rstrip('/')}/{summary_filename}"
+            )
         return
 
+    config = _build_cfg()
     run_single_experiment(
-        exp_name=os.path.splitext(os.path.basename(args.summary_json))[0] if args.summary_json else "flint_jax_run",
+        exp_name=os.path.splitext(os.path.basename(args.summary_json))[0]
+        if args.summary_json
+        else "flint_jax_run",
         config=config,
         seq_len=args.seq_len,
         per_device_batch_size=args.per_device_batch_size,
+        grad_accum_steps=args.grad_accum_steps,
         steps=args.steps,
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
@@ -621,4 +708,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
