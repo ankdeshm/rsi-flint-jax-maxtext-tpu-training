@@ -1,0 +1,150 @@
+# Option B: Multi-Node Indexed Job + Headless Service for Running Immediately Across 4 Healthy `2x2x1` Spot Nodes
+# Pulls all training scripts/configs directly from:
+#   gs://YOUR_GCS_BUCKET/flint-jax-training
+# Why this manifest works immediately:
+#   - While `tpu-v5p-16-pool` (2x2x4) waits for 4 new hosts in `us-central1-a`,
+#     cluster `tpu-v5p-cluster` ALREADY has 14 healthy running `2x2x1` Spot nodes (`ct5p-hightpu-4t`).
+#   - This Indexed Job schedules 4 pods across 4 of those running `2x2x1` nodes (4 x 4 chips = 16 TPU v5p chips,
+#     1,520 GB HBM) and coordinates multi-slice JAX training over DCN using `MEGASCALE_COORDINATOR_ADDRESS`.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flint-v5p-multislice-headless
+  namespace: default
+  labels:
+    app: flint-v5p-multislice-train
+spec:
+  clusterIP: None
+  selector:
+    job-name: flint-v5p-multislice-4x2x2x1
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flint-v5p-multislice-4x2x2x1
+  namespace: default
+  labels:
+    app: flint-v5p-multislice-train
+    model: recursive-flint-40b-a2-5b
+spec:
+  backoffLimit: 10
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        app: flint-v5p-multislice-train
+    spec:
+      subdomain: flint-v5p-multislice-headless
+      restartPolicy: OnFailure
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: flint-v5p-multislice-train
+              topologyKey: "kubernetes.io/hostname"
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v5p-slice
+        cloud.google.com/gke-tpu-topology: 2x2x1
+        cloud.google.com/gke-spot: "true"
+      tolerations:
+        - key: "google.com/tpu"
+          operator: "Equal"
+          value: "present"
+          effect: "NoSchedule"
+        - key: "cloud.google.com/gke-spot"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: local-ssd
+          emptyDir: {}
+      containers:
+        - name: jax-tpu-trainer
+          image: us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/maxtext/maxtext:latest
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          env:
+            - name: JAX_PLATFORMS
+              value: "tpu,cpu"
+            - name: ENABLE_PJRT_COMPATIBILITY
+              value: "true"
+            - name: GCS_BUCKET_ROOT
+              value: "gs://YOUR_GCS_BUCKET/flint-jax-training"
+            - name: BASE_OUTPUT_DIR
+              value: "gs://YOUR_GCS_BUCKET/flint-jax-training/checkpoints"
+            - name: MEGASCALE_COORDINATOR_ADDRESS
+              value: "flint-v5p-multislice-4x2x2x1-0.flint-v5p-multislice-headless.default.svc.cluster.local:8476"
+            - name: MEGASCALE_NUM_SLICES
+              value: "4"
+            - name: MEGASCALE_SLICE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            - name: LIBTPU_INIT_ARGS
+              value: >-
+                --xla_tpu_scoped_vmem_limit_kib=81920
+                --xla_tpu_overlap_compute_collective_tc=true
+                --xla_enable_async_all_gather=true
+                --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                --xla_tpu_data_parallel_opt_different_sized_ops=true
+                --xla_tpu_use_minor_sharding_for_major_trivial_input=true
+                --xla_tpu_relayout_group_size_threshold_for_reduce_scatter=1
+                --xla_tpu_assign_all_reduce_scatter_layout=true
+                --xla_tpu_enable_all_experimental_scheduler_features=true
+                --xla_tpu_enable_scheduler_memory_pressure_tracking=true
+                --xla_tpu_host_transfer_overlap_limit=24
+                --xla_tpu_aggressive_opt_barrier_removal=ENABLED
+                --xla_lhs_prioritize_async_depth_over_stall=ENABLED
+                --xla_tpu_enable_ag_backward_pipelining=true
+                --xla_should_allow_loop_variant_parameter_in_chain=ENABLED
+                --xla_should_add_loop_invariant_op_in_chain=ENABLED
+                --xla_max_concurrent_host_send_recv=100
+                --xla_tpu_scheduler_percent_shared_memory_limit=100
+                --xla_latency_hiding_scheduler_rerun=2
+          resources:
+            requests:
+              google.com/tpu: 4
+              cpu: "100"
+              memory: "350Gi"
+            limits:
+              google.com/tpu: 4
+              cpu: "180"
+              memory: "400Gi"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: local-ssd
+              mountPath: /scratch
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              echo "=== Multi-Slice Worker (Slice ${JOB_COMPLETION_INDEX}/4) starting on $(hostname) ==="
+
+              # Pull training package & configs directly from gs://YOUR_GCS_BUCKET/flint-jax-training
+              mkdir -p /scratch/flint-jax-training
+              gcloud storage cp -r "${GCS_BUCKET_ROOT}/*" /scratch/flint-jax-training/
+              export PYTHONPATH="/scratch/flint-jax-training:${PYTHONPATH:-}"
+
+              curl -sL https://huggingface.co/RecursiveSI/flint/raw/main/config.json -o /scratch/flint-jax-training/config.json
+
+              python3 -u -m flint_jax.train \
+                --config-json=/scratch/flint-jax-training/config.json \
+                --output-dir="${BASE_OUTPUT_DIR}" \
+                --seq-len=4096 \
+                --per-device-batch-size=1 \
+                --data-parallel=1 \
+                --fsdp-parallel=4 \
+                --expert-parallel=4 \
+                --tensor-parallel=1 \
+                --steps=500 2>&1 | tee /scratch/train-slice-${JOB_COMPLETION_INDEX}.log
+              gcloud storage cp /scratch/train-slice-${JOB_COMPLETION_INDEX}.log "${BASE_OUTPUT_DIR}/logs/train-slice-${JOB_COMPLETION_INDEX}.log" || true

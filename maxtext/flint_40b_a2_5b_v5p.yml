@@ -1,0 +1,73 @@
+# MaxText Configuration for Recursive Flint (39.8B Total / 2.5B Active MoE) on TPU v5p (2x2x4 = 16 chips)
+# References:
+#   - Model card & config: https://huggingface.co/RecursiveSI/flint/blob/main/config.json
+#   - TPU v5p recipes: https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/training/v5p
+#   - MaxText MoE kernels: https://github.com/AI-Hypercomputer/maxtext
+
+base_config: "base.yml"
+
+run_name: "flint-40b-a2-5b-v5p-bf16"
+base_output_directory: "gs://YOUR_GCS_BUCKET/flint-jax-training/maxtext-runs"
+hardware: "tpu"
+
+# Model Architecture (Flint 39.8B-A2.5B)
+decoder_block: "deepseek"  # Hybrid dense + routed MoE + shared expert block in MaxText
+vocab_size: 150144
+base_emb_dim: 2048
+base_num_query_heads: 32
+base_num_kv_heads: 4
+head_dim: 128
+base_num_decoder_layers: 49
+first_num_dense_layers: 2          # Layers 0 and 1 are dense SwiGLU MLPs (mlp_only_layers: [0, 1])
+base_mlp_dim: 6144                 # intermediate_size for dense layers
+base_moe_mlp_dim: 512              # moe_intermediate_size for routed experts
+shared_experts: 1                  # 1 always-active shared expert (intermediate_size=1024 -> 2x512 or custom 1024)
+num_experts: 256                   # 256 routed experts per MoE layer
+num_experts_per_tok: 6             # top-6 routing
+routed_score_func: "sigmoid"       # router_score_function: "sigmoid"
+norm_topk_prob: true
+mlp_activations: ["silu", "linear"]
+normalization_layer_epsilon: 1.0e-06
+qk_layernorm: true                 # Per-head QK RMSNorm
+rope_max_timescale: 10000.0
+sliding_window_size: 513           # 35 sliding-window layers (513 tokens) + 14 full-attention layers
+
+# Precision & Megablox / Pallas MoE Kernel Settings (BF16 compute + BF16/FP32 weights)
+dtype: "bfloat16"
+weight_dtype: "bfloat16"
+megablox: true
+sparse_matmul: true
+attention: "flash"
+
+# Sharding for 4-node TPU v5p-32 (`2x2x4` topology = 16 chips) on `tpu-v5p-16-pool`
+ici_data_parallelism: 1
+ici_fsdp_parallelism: 4
+ici_expert_parallelism: 4
+ici_tensor_parallelism: 1
+
+# Activation Checkpointing (Remat) & Offloading for Long Context
+remat_policy: "custom"
+decoder_layer_input: "offload"
+query_proj: "offload"
+key_proj: "offload"
+value_proj: "offload"
+out_proj: "offload"
+
+# Training Hyperparameters
+per_device_batch_size: 2
+max_target_length: 8192
+steps: 1000
+opt_type: "adamw"
+learning_rate: 1.5e-4
+adam_b1: 0.9
+adam_b2: 0.95
+adam_eps: 1.0e-8
+adam_weight_decay: 0.1
+gradient_clipping_threshold: 1.0
+warmup_steps_fraction: 0.05
+
+# Spot TPU Preemption-Resilient Checkpointing
+enable_checkpointing: true
+async_checkpointing: true
+checkpoint_period: 50
+dataset_type: "synthetic"
