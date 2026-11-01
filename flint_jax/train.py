@@ -73,7 +73,9 @@ def create_tpu_mesh(
     expert_parallel: int,
     tensor_parallel: int,
 ) -> Mesh:
-    """Creates a 4D (data, fsdp, expert, tensor) JAX Mesh over all visible TPU devices."""
+    """Creates a topology-aware 4D (data, fsdp, expert, tensor) JAX Mesh over all visible TPU devices."""
+    from jax.experimental import mesh_utils
+
     devices = jax.devices()
     num_devices = len(devices)
     expected = data_parallel * fsdp_parallel * expert_parallel * tensor_parallel
@@ -82,9 +84,17 @@ def create_tpu_mesh(
             f"Mesh product ({data_parallel} * {fsdp_parallel} * {expert_parallel} * {tensor_parallel} = {expected}) "
             f"must equal total TPU devices ({num_devices})."
         )
-    device_mesh = np.array(devices).reshape(
-        data_parallel, fsdp_parallel, expert_parallel, tensor_parallel
-    )
+    try:
+        device_mesh = mesh_utils.create_device_mesh(
+            (data_parallel, fsdp_parallel, expert_parallel, tensor_parallel),
+            devices=devices,
+            allow_split_physical_axes=True,
+        )
+    except Exception as exc:
+        logger.warning("mesh_utils.create_device_mesh fallback to flat reshape (%s)", exc)
+        device_mesh = np.array(devices).reshape(
+            data_parallel, fsdp_parallel, expert_parallel, tensor_parallel
+        )
     return Mesh(device_mesh, axis_names=("data", "fsdp", "expert", "tensor"))
 
 
@@ -463,6 +473,8 @@ def run_single_experiment(
             "per_device_batch_size": per_device_batch_size,
             "grad_accum_steps": grad_accum_steps,
             "remat_first_n_layers": config.remat_first_n_layers if config.remat_layers else 0,
+            "save_splash_attn_layers": config.save_splash_attn_layers,
+            "splash_block_size": config.splash_block_size,
             "use_splash_attention": config.use_splash_attention,
             "tokens_per_step": tokens_per_step,
             "flops_per_token_g": round(flops_per_token / 1e9, 4),
@@ -500,6 +512,8 @@ def run_single_experiment(
             "seq_len": seq_len,
             "per_device_batch_size": per_device_batch_size,
             "grad_accum_steps": grad_accum_steps,
+            "save_splash_attn_layers": config.save_splash_attn_layers,
+            "splash_block_size": config.splash_block_size,
             "tokens_per_step": tokens_per_step,
             "mesh": {
                 "data": data_parallel,
@@ -540,6 +554,8 @@ def main() -> None:
     parser.add_argument("--per-device-batch-size", type=int, default=16, help="Micro-batch size per TPU chip")
     parser.add_argument("--grad-accum-steps", type=int, default=2, help="Gradient accumulation microbatches per optimizer step")
     parser.add_argument("--remat-first-n-layers", type=int, default=49, help="Number of leading layers to activation-checkpoint (49 = full remat)")
+    parser.add_argument("--save-splash-attn-layers", type=int, default=0, help="Number of layers (full-attn prioritized) that skip attention remat while still rematting MoE")
+    parser.add_argument("--splash-block-size", type=int, default=512, help="SplashAttention block size on full-attention layers")
     parser.add_argument("--steps", type=int, default=12, help="Total training steps")
     parser.add_argument("--learning-rate", type=float, default=1.5e-4)
     parser.add_argument("--warmup-steps", type=int, default=3)
@@ -553,6 +569,8 @@ def main() -> None:
     parser.add_argument("--summary-json", type=str, default=None, help="Optional path to write JSON benchmark summary")
     parser.add_argument("--sweep-v5p16", action="store_true", help="Run baseline 6-config 2x2x4 SPMD mesh sweep")
     parser.add_argument("--sweep-v5p16-opt", action="store_true", help="Run optimized high-MFU SplashAttention + fused ragged_dot hillclimb sweep on 2x2x4 TPU v5p")
+    parser.add_argument("--sweep-v5p16-r6", action="store_true", help="Run Round 6 high-batch (mb=64..96) + selective MLP-only remat + sa=1024 frontier sweep on 2x2x4 TPU v5p")
+    parser.add_argument("--sweep-v5p32-r6", action="store_true", help="Run Round 6 32-chip (2x4x4) TPU v5p-32 FSDP=32 + HSDP 2x16 + FSDP=8xEP=4 frontier sweep")
     parser.add_argument("--sweep-output-dir", type=str, default="/scratch/results", help="Local directory for sweep JSON outputs")
     parser.add_argument("--gcs-results-prefix", type=str, default="flint-jax-training/results", help="GCS prefix for immediate result upload")
     args = parser.parse_args()
@@ -610,6 +628,8 @@ def main() -> None:
         "dtype": jnp.bfloat16,
         "weight_dtype": jnp.bfloat16,
         "remat_first_n_layers": args.remat_first_n_layers,
+        "save_splash_attn_layers": args.save_splash_attn_layers,
+        "splash_block_size": args.splash_block_size,
     }
     if args.num_layers_override is not None:
         base_overrides["num_hidden_layers"] = args.num_layers_override
@@ -621,36 +641,61 @@ def main() -> None:
             return FlintJAXConfig.from_json_file(args.config_json, **merged)
         return FlintJAXConfig(**merged)
 
-    if args.sweep_v5p16 or args.sweep_v5p16_opt:
+    if args.sweep_v5p16 or args.sweep_v5p16_opt or args.sweep_v5p16_r6 or args.sweep_v5p32_r6:
         import json as _json
 
-        if args.sweep_v5p16_opt:
-            # (exp_name, seq_len, mb, ga, remat_n, dp, fsdp, ep, tp)
+        if args.sweep_v5p32_r6:
+            # (exp_name, seq_len, mb, ga, remat_n, save_splash, sa_block, dp, fsdp, ep, tp)
             sweep_specs = [
-                ("jax_opt01_fsdp16_ep1_s2048_mb8_ga1", 2048, 8, 1, 49, 1, 16, 1, 1),
-                ("jax_opt02_fsdp16_ep1_s2048_mb16_ga2", 2048, 16, 2, 49, 1, 16, 1, 1),
-                ("jax_opt03_fsdp16_ep1_s2048_mb24_ga2", 2048, 24, 2, 49, 1, 16, 1, 1),
-                ("jax_opt04_fsdp16_ep1_s2048_mb32_ga2", 2048, 32, 2, 49, 1, 16, 1, 1),
-                ("jax_opt05_fsdp16_ep1_s2048_mb32_ga4_hybac32", 2048, 32, 4, 32, 1, 16, 1, 1),
-                ("jax_opt06_fsdp16_ep1_s2048_mb48_ga2", 2048, 48, 2, 49, 1, 16, 1, 1),
-                ("jax_opt07_fsdp4_ep4_s2048_mb16_ga2", 2048, 16, 2, 49, 1, 4, 4, 1),
-                ("jax_opt08_fsdp16_ep1_s4096_mb16_ga2", 4096, 16, 2, 49, 1, 16, 1, 1),
+                ("jax_v5p32_01_fsdp32_s2048_mb64_ga2_sa1024", 2048, 64, 2, 49, 0, 1024, 1, 32, 1, 1),
+                ("jax_v5p32_02_dp2_fsdp16_s2048_mb64_ga2_sa1024", 2048, 64, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_03_dp2_fsdp16_s2048_mb80_ga2_sa1024_noattnremat12", 2048, 80, 2, 49, 12, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_04_fsdp32_s2048_mb96_ga2_sa1024_noattnremat12", 2048, 96, 2, 49, 12, 1024, 1, 32, 1, 1),
+                ("jax_v5p32_05_dp2_fsdp16_s4096_mb32_ga2_sa1024_noattnremat12", 4096, 32, 2, 49, 12, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_06_fsdp8_ep4_s2048_mb48_ga2_sa1024", 2048, 48, 2, 49, 0, 1024, 1, 8, 4, 1),
+            ]
+            summary_filename = "jax_v5p32_r6_sweep_summary.json"
+        elif args.sweep_v5p16_r6:
+            # (exp_name, seq_len, mb, ga, remat_n, save_splash, sa_block, dp, fsdp, ep, tp)
+            sweep_specs = [
+                ("jax_r6_01_fsdp16_s2048_mb64_ga2_sa1024", 2048, 64, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_r6_02_fsdp16_s2048_mb64_ga2_sa1024_noattnremat12", 2048, 64, 2, 49, 12, 1024, 1, 16, 1, 1),
+                ("jax_r6_03_fsdp16_s2048_mb80_ga2_sa1024", 2048, 80, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_r6_04_fsdp16_s2048_mb96_ga2_sa1024", 2048, 96, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_r6_05_fsdp16_s2048_mb64_ga4_sa1024_noattnremat24", 2048, 64, 4, 49, 24, 1024, 1, 16, 1, 1),
+                ("jax_r6_06_fsdp16_s4096_mb32_ga2_sa1024_noattnremat12", 4096, 32, 2, 49, 12, 1024, 1, 16, 1, 1),
+            ]
+            summary_filename = "jax_v5p16_r6_sweep_summary.json"
+        elif args.sweep_v5p16_opt:
+            sweep_specs = [
+                ("jax_opt01_fsdp16_ep1_s2048_mb8_ga1", 2048, 8, 1, 49, 0, 512, 1, 16, 1, 1),
+                ("jax_opt02_fsdp16_ep1_s2048_mb16_ga2", 2048, 16, 2, 49, 0, 512, 1, 16, 1, 1),
+                ("jax_opt03_fsdp16_ep1_s2048_mb24_ga2", 2048, 24, 2, 49, 0, 512, 1, 16, 1, 1),
+                ("jax_opt04_fsdp16_ep1_s2048_mb32_ga2", 2048, 32, 2, 49, 0, 512, 1, 16, 1, 1),
+                ("jax_opt05_fsdp16_ep1_s2048_mb32_ga4_hybac32", 2048, 32, 4, 32, 0, 512, 1, 16, 1, 1),
+                ("jax_opt06_fsdp16_ep1_s2048_mb48_ga2", 2048, 48, 2, 49, 0, 512, 1, 16, 1, 1),
+                ("jax_opt07_fsdp4_ep4_s2048_mb16_ga2", 2048, 16, 2, 49, 0, 512, 1, 4, 4, 1),
+                ("jax_opt08_fsdp16_ep1_s4096_mb16_ga2", 4096, 16, 2, 49, 0, 512, 1, 16, 1, 1),
             ]
             summary_filename = "jax_v5p16_opt_sweep_summary.json"
         else:
             sweep_specs = [
-                ("jax_v5p16_fsdp4_ep4_s2048_mb2", 2048, 2, 1, 49, 1, 4, 4, 1),
-                ("jax_v5p16_fsdp4_ep4_s2048_mb4", 2048, 4, 1, 49, 1, 4, 4, 1),
-                ("jax_v5p16_fsdp8_ep2_s2048_mb4", 2048, 4, 1, 49, 1, 8, 2, 1),
-                ("jax_v5p16_fsdp16_ep1_s2048_mb4", 2048, 4, 1, 49, 1, 16, 1, 1),
-                ("jax_v5p16_fsdp4_ep4_s4096_mb2", 4096, 2, 1, 49, 1, 4, 4, 1),
-                ("jax_v5p16_fsdp4_ep4_s4096_mb4", 4096, 4, 1, 49, 1, 4, 4, 1),
+                ("jax_v5p16_fsdp4_ep4_s2048_mb2", 2048, 2, 1, 49, 0, 512, 1, 4, 4, 1),
+                ("jax_v5p16_fsdp4_ep4_s2048_mb4", 2048, 4, 1, 49, 0, 512, 1, 4, 4, 1),
+                ("jax_v5p16_fsdp8_ep2_s2048_mb4", 2048, 4, 1, 49, 0, 512, 1, 8, 2, 1),
+                ("jax_v5p16_fsdp16_ep1_s2048_mb4", 2048, 4, 1, 49, 0, 512, 1, 16, 1, 1),
+                ("jax_v5p16_fsdp4_ep4_s4096_mb2", 4096, 2, 1, 49, 0, 512, 1, 4, 4, 1),
+                ("jax_v5p16_fsdp4_ep4_s4096_mb4", 4096, 4, 1, 49, 0, 512, 1, 4, 4, 1),
             ]
             summary_filename = "jax_v5p16_sweep_summary.json"
 
         all_results: list[dict[str, Any]] = []
-        for exp_name, seq_len, mb, ga, remat_n, dp, fsdp, ep, tp in sweep_specs:
-            cfg = _build_cfg(remat_first_n_layers=remat_n)
+        for exp_name, seq_len, mb, ga, remat_n, save_splash, sa_block, dp, fsdp, ep, tp in sweep_specs:
+            cfg = _build_cfg(
+                remat_first_n_layers=remat_n,
+                save_splash_attn_layers=save_splash,
+                splash_block_size=sa_block,
+            )
             out_json = os.path.join(args.sweep_output_dir, f"{exp_name}.json")
             res = run_single_experiment(
                 exp_name=exp_name,

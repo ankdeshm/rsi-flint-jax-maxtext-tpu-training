@@ -121,6 +121,7 @@ class FlintJAXConfig:
     splash_block_size: int = 512
     remat_layers: bool = True
     remat_first_n_layers: int = 49
+    save_splash_attn_layers: int = 0
     ce_chunk_tokens: int = 256
 
     def is_dense_layer(self, layer_id: int) -> bool:

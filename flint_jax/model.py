@@ -57,20 +57,36 @@ class FlintRMSNorm(nn.Module):
         return (normed * weight.astype(jnp.float32)).astype(self.dtype)
 
 
+def precompute_rope_cos_sin(
+    positions: jnp.ndarray,
+    head_dim: int = 128,
+    rope_theta: float = 10000.0,
+    dtype: Any = jnp.bfloat16,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Precomputes BF16 RoPE (cos, sin) once per microbatch on [1, seq_len] if broadcastable."""
+    half_dim = head_dim // 2
+    freq_seq = jnp.arange(0, half_dim, dtype=jnp.float32) / float(half_dim)
+    inv_freq = 1.0 / (rope_theta ** freq_seq)
+    angles = jnp.einsum("bs,d->bsd", positions.astype(jnp.float32), inv_freq)[:, :, None, :]
+    return jnp.cos(angles).astype(dtype), jnp.sin(angles).astype(dtype)
+
+
 def apply_rope(
     q: jnp.ndarray,
     k: jnp.ndarray,
     positions: jnp.ndarray,
     head_dim: int = 128,
     rope_theta: float = 10000.0,
+    rope_cos_sin: tuple[jnp.ndarray, jnp.ndarray] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Applies NeoX/Llama-style half-rotated RoPE directly in activation dtype (BF16)."""
     half_dim = head_dim // 2
-    freq_seq = jnp.arange(0, half_dim, dtype=jnp.float32) / float(half_dim)
-    inv_freq = 1.0 / (rope_theta ** freq_seq)
-    angles = jnp.einsum("bs,d->bsd", positions.astype(jnp.float32), inv_freq)[:, :, None, :]
-    cos = jnp.cos(angles).astype(q.dtype)
-    sin = jnp.sin(angles).astype(q.dtype)
+    if rope_cos_sin is not None:
+        cos, sin = rope_cos_sin
+        cos = cos.astype(q.dtype)
+        sin = sin.astype(q.dtype)
+    else:
+        cos, sin = precompute_rope_cos_sin(positions, head_dim=head_dim, rope_theta=rope_theta, dtype=q.dtype)
 
     def _rotate(x: jnp.ndarray) -> jnp.ndarray:
         x1 = x[..., :half_dim]
@@ -155,8 +171,9 @@ def splash_attention_with_learned_sinks(
     """TPU Pallas Block-Sparse SplashAttention with native learned `sinks` (`softmax_offset`)."""
     seq_len = q.shape[1]
     head_dim = q.shape[3]
-    b_sz = min(block_size, seq_len)
-    b_comp = min(256, b_sz)
+    eff_block = 512 if is_sliding else block_size
+    b_sz = min(eff_block, seq_len)
+    b_comp = min(512 if b_sz >= 1024 else 256, b_sz)
     block_sizes = splash_attention_kernel.BlockSizes(
         block_q=b_sz,
         block_kv=b_sz,
@@ -231,7 +248,12 @@ class FlintAttention(nn.Module):
     mesh: Any = None
 
     @nn.compact
-    def __call__(self, hidden_states: jnp.ndarray, positions: jnp.ndarray) -> jnp.ndarray:
+    def __call__(
+        self,
+        hidden_states: jnp.ndarray,
+        positions: jnp.ndarray,
+        rope_cos_sin: tuple[jnp.ndarray, jnp.ndarray] | None = None,
+    ) -> jnp.ndarray:
         cfg = self.config
         bsz, seq_len, _ = hidden_states.shape
         q_dim = cfg.num_attention_heads * cfg.head_dim
@@ -308,6 +330,7 @@ class FlintAttention(nn.Module):
                 positions=positions,
                 head_dim=cfg.head_dim,
                 rope_theta=cfg.rope_theta,
+                rope_cos_sin=rope_cos_sin,
             )
 
         softmax_offset = self.param(
@@ -329,6 +352,7 @@ class FlintAttention(nn.Module):
                 block_size=cfg.splash_block_size,
                 dtype=cfg.dtype,
             )
+            attn_out = jax.ad_checkpoint.checkpoint_name(attn_out, "splash_attn_out")
         else:
             attn_out = attention_with_learned_sinks(
                 q,
@@ -644,12 +668,14 @@ class FlintDecoderLayer(nn.Module):
     config: FlintJAXConfig
     layer_id: int
     mesh: Any = None
+    remat_mlp_only: bool = False
 
     @nn.compact
     def __call__(
         self,
         hidden_states: jnp.ndarray,
         positions: jnp.ndarray,
+        rope_cos_sin: tuple[jnp.ndarray, jnp.ndarray] | None = None,
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         cfg = self.config
 
@@ -667,7 +693,7 @@ class FlintDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             mesh=self.mesh,
             name="self_attn",
-        )(normed_attn_in, positions)
+        )(normed_attn_in, positions, rope_cos_sin)
 
         hidden_states = hidden_states + attn_out
 
@@ -680,8 +706,10 @@ class FlintDecoderLayer(nn.Module):
             name="post_attention_layernorm",
         )(hidden_states)
 
+        use_mlp_remat = self.remat_mlp_only and not self.is_initializing()
         if cfg.is_dense_layer(self.layer_id):
-            mlp_out = FlintMLP(
+            MlpCls = nn.remat(FlintMLP) if use_mlp_remat else FlintMLP
+            mlp_out = MlpCls(
                 hidden_size=cfg.hidden_size,
                 intermediate_size=cfg.intermediate_size,
                 dtype=cfg.dtype,
@@ -691,7 +719,8 @@ class FlintDecoderLayer(nn.Module):
             )(normed_mlp_in)
             aux_loss = jnp.array(0.0, dtype=jnp.float32)
         else:
-            mlp_out, aux_loss = FlintSparseMoeBlock(
+            MoeCls = nn.remat(FlintSparseMoeBlock) if use_mlp_remat else FlintSparseMoeBlock
+            mlp_out, aux_loss = MoeCls(
                 config=cfg,
                 layer_id=self.layer_id,
                 mesh=self.mesh,
@@ -761,8 +790,20 @@ class FlintForCausalLM(nn.Module):
         cfg = self.config
         bsz, seq_len = input_ids.shape
         if positions is None:
-            positions = jnp.broadcast_to(
-                jnp.arange(seq_len, dtype=jnp.int32)[None, :], (bsz, seq_len)
+            pos_1d = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+            positions = jnp.broadcast_to(pos_1d, (bsz, seq_len))
+            rope_cos_sin = precompute_rope_cos_sin(
+                pos_1d,
+                head_dim=cfg.head_dim,
+                rope_theta=cfg.rope_theta,
+                dtype=cfg.dtype,
+            )
+        else:
+            rope_cos_sin = precompute_rope_cos_sin(
+                positions,
+                head_dim=cfg.head_dim,
+                rope_theta=cfg.rope_theta,
+                dtype=cfg.dtype,
             )
 
         embed_tokens = nn.Embed(
@@ -785,19 +826,42 @@ class FlintForCausalLM(nn.Module):
         total_aux_loss = jnp.array(0.0, dtype=jnp.float32)
         RematDecoderLayer = nn.remat(FlintDecoderLayer)
 
+        no_attn_remat_set: set[int] = set()
+        if not self.is_initializing() and cfg.save_splash_attn_layers > 0:
+            ranked_layers = [
+                lid
+                for lid in reversed(range(cfg.num_hidden_layers))
+                if not cfg.is_sliding_layer(lid)
+            ] + [
+                lid
+                for lid in reversed(range(cfg.num_hidden_layers))
+                if cfg.is_sliding_layer(lid)
+            ]
+            no_attn_remat_set = set(ranked_layers[: cfg.save_splash_attn_layers])
+
         for layer_id in range(cfg.num_hidden_layers):
-            use_remat = (
-                not self.is_initializing()
-                and cfg.remat_layers
-                and layer_id < cfg.remat_first_n_layers
-            )
-            LayerCls = RematDecoderLayer if use_remat else FlintDecoderLayer
-            hidden_states, layer_aux_loss = LayerCls(
-                config=cfg,
-                layer_id=layer_id,
-                mesh=self.mesh,
-                name=f"layers_{layer_id}",
-            )(hidden_states, positions)
+            if layer_id in no_attn_remat_set:
+                hidden_states, layer_aux_loss = FlintDecoderLayer(
+                    config=cfg,
+                    layer_id=layer_id,
+                    mesh=self.mesh,
+                    remat_mlp_only=True,
+                    name=f"layers_{layer_id}",
+                )(hidden_states, positions, rope_cos_sin)
+            else:
+                use_remat = (
+                    not self.is_initializing()
+                    and cfg.remat_layers
+                    and layer_id < cfg.remat_first_n_layers
+                )
+                LayerCls = RematDecoderLayer if use_remat else FlintDecoderLayer
+                hidden_states, layer_aux_loss = LayerCls(
+                    config=cfg,
+                    layer_id=layer_id,
+                    mesh=self.mesh,
+                    remat_mlp_only=False,
+                    name=f"layers_{layer_id}",
+                )(hidden_states, positions, rope_cos_sin)
             if self.mesh is not None:
                 hidden_states = jax.lax.with_sharding_constraint(
                     hidden_states, P(("data", "fsdp", "expert"), None, None)
