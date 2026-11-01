@@ -1,0 +1,20 @@
+{
+  "exp_name": "jax_v5p32_04_fsdp32_s2048_mb96_ga2_sa1024_noattnremat12",
+  "status": "OOM",
+  "error": "JaxRuntimeError: RESOURCE_EXHAUSTED: E1000: CompileTimeHbmOom: Ran out of memory on HBM, the total memory required for HLO temporaries (170.40G) exceeds available HBM (95.73G). HLO module: jit_train_step.\nSee https://openxla.org/xla/errors/error_1000 for more details.",
+  "device_kind": "TPU v5",
+  "num_devices": 32,
+  "seq_len": 2048,
+  "per_device_batch_size": 96,
+  "grad_accum_steps": 2,
+  "save_splash_attn_layers": 12,
+  "splash_block_size": 1024,
+  "tokens_per_step": 12582912,
+  "mesh": {
+    "data": 1,
+    "fsdp": 32,
+    "expert": 1,
+    "tensor": 1
+  },
+  "steps": []
+}

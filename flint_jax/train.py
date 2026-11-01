@@ -571,6 +571,10 @@ def main() -> None:
     parser.add_argument("--sweep-v5p16-opt", action="store_true", help="Run optimized high-MFU SplashAttention + fused ragged_dot hillclimb sweep on 2x2x4 TPU v5p")
     parser.add_argument("--sweep-v5p16-r6", action="store_true", help="Run Round 6 high-batch (mb=64..96) + selective MLP-only remat + sa=1024 frontier sweep on 2x2x4 TPU v5p")
     parser.add_argument("--sweep-v5p32-r6", action="store_true", help="Run Round 6 32-chip (2x4x4) TPU v5p-32 FSDP=32 + HSDP 2x16 + FSDP=8xEP=4 frontier sweep")
+    parser.add_argument("--sweep-v5p16-r7", action="store_true", help="Run Round 7 16-chip (2x2x4) HSDP 2x8 + mb=96..112 + ga=4 + 4K frontier sweep")
+    parser.add_argument("--sweep-v5p32-r7", action="store_true", help="Run Round 7 32-chip (2x4x4) HSDP 2x16 mb=80..112 + ga=4 + HSDP 4x8 + 4K frontier sweep")
+    parser.add_argument("--sweep-v7x16-r7", action="store_true", help="Run Round 7 Ironwood v7x-16 (2x2x4, 32 TensorCores) FSDP=32 + HSDP 2x16 + HSDP 4x8 frontier sweep")
+    parser.add_argument("--sweep-v7x16-r8", action="store_true", help="Run Round 8 Ironwood v7x-16 (2x2x4, 32 TensorCores) HBM-calibrated mb=32..64 + HSDP 2x16 + EP=4 sweep")
     parser.add_argument("--sweep-output-dir", type=str, default="/scratch/results", help="Local directory for sweep JSON outputs")
     parser.add_argument("--gcs-results-prefix", type=str, default="flint-jax-training/results", help="GCS prefix for immediate result upload")
     args = parser.parse_args()
@@ -641,10 +645,66 @@ def main() -> None:
             return FlintJAXConfig.from_json_file(args.config_json, **merged)
         return FlintJAXConfig(**merged)
 
-    if args.sweep_v5p16 or args.sweep_v5p16_opt or args.sweep_v5p16_r6 or args.sweep_v5p32_r6:
+    if (
+        args.sweep_v5p16
+        or args.sweep_v5p16_opt
+        or args.sweep_v5p16_r6
+        or args.sweep_v5p32_r6
+        or args.sweep_v5p16_r7
+        or args.sweep_v5p32_r7
+        or args.sweep_v7x16_r7
+        or args.sweep_v7x16_r8
+    ):
         import json as _json
 
-        if args.sweep_v5p32_r6:
+        if args.sweep_v7x16_r8:
+            # (exp_name, seq_len, mb, ga, remat_n, save_splash, sa_block, dp, fsdp, ep, tp)
+            sweep_specs = [
+                ("jax_v7x16_r8_01_dp2_fsdp16_s2048_mb32_ga2_sa1024", 2048, 32, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r8_02_dp2_fsdp16_s2048_mb48_ga2_sa1024", 2048, 48, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r8_03_fsdp32_s2048_mb48_ga2_sa1024", 2048, 48, 2, 49, 0, 1024, 1, 32, 1, 1),
+                ("jax_v7x16_r8_04_dp2_fsdp16_s2048_mb48_ga4_sa1024", 2048, 48, 4, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r8_05_dp2_fsdp16_s2048_mb64_ga2_sa1024", 2048, 64, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r8_06_dp4_fsdp8_s2048_mb48_ga2_sa1024", 2048, 48, 2, 49, 0, 1024, 4, 8, 1, 1),
+                ("jax_v7x16_r8_07_fsdp8_ep4_s2048_mb32_ga2_sa1024", 2048, 32, 2, 49, 0, 1024, 1, 8, 4, 1),
+            ]
+            summary_filename = "jax_v7x16_r8_sweep_summary.json"
+        elif args.sweep_v7x16_r7:
+            # (exp_name, seq_len, mb, ga, remat_n, save_splash, sa_block, dp, fsdp, ep, tp)
+            sweep_specs = [
+                ("jax_v7x16_r7_01_fsdp32_s2048_mb64_ga2_sa1024", 2048, 64, 2, 49, 0, 1024, 1, 32, 1, 1),
+                ("jax_v7x16_r7_02_dp2_fsdp16_s2048_mb64_ga2_sa1024", 2048, 64, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r7_03_dp2_fsdp16_s2048_mb80_ga2_sa1024", 2048, 80, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r7_04_dp2_fsdp16_s2048_mb96_ga2_sa1024", 2048, 96, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r7_05_dp2_fsdp16_s2048_mb96_ga4_sa1024", 2048, 96, 4, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v7x16_r7_06_dp4_fsdp8_s2048_mb64_ga2_sa1024", 2048, 64, 2, 49, 0, 1024, 4, 8, 1, 1),
+            ]
+            summary_filename = "jax_v7x16_r7_sweep_summary.json"
+        elif args.sweep_v5p32_r7:
+            # (exp_name, seq_len, mb, ga, remat_n, save_splash, sa_block, dp, fsdp, ep, tp)
+            sweep_specs = [
+                ("jax_v5p32_r7_01_dp2_fsdp16_s2048_mb80_ga2_sa1024", 2048, 80, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r7_02_dp2_fsdp16_s2048_mb96_ga2_sa1024", 2048, 96, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r7_03_dp2_fsdp16_s2048_mb96_ga4_sa1024", 2048, 96, 4, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r7_04_dp2_fsdp16_s2048_mb112_ga2_sa1024", 2048, 112, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r7_05_dp2_fsdp16_s2048_mb112_ga4_sa1024", 2048, 112, 4, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r7_06_dp2_fsdp16_s4096_mb48_ga2_sa1024", 4096, 48, 2, 49, 0, 1024, 2, 16, 1, 1),
+                ("jax_v5p32_r7_07_dp4_fsdp8_s2048_mb64_ga2_sa1024", 2048, 64, 2, 49, 0, 1024, 4, 8, 1, 1),
+            ]
+            summary_filename = "jax_v5p32_r7_sweep_summary.json"
+        elif args.sweep_v5p16_r7:
+            # (exp_name, seq_len, mb, ga, remat_n, save_splash, sa_block, dp, fsdp, ep, tp)
+            sweep_specs = [
+                ("jax_r7_01_fsdp16_s2048_mb112_ga2_sa1024", 2048, 112, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_r7_02_fsdp16_s2048_mb96_ga4_sa1024", 2048, 96, 4, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_r7_03_dp2_fsdp8_s2048_mb80_ga2_sa1024", 2048, 80, 2, 49, 0, 1024, 2, 8, 1, 1),
+                ("jax_r7_04_dp2_fsdp8_s2048_mb96_ga2_sa1024", 2048, 96, 2, 49, 0, 1024, 2, 8, 1, 1),
+                ("jax_r7_05_dp2_fsdp8_s2048_mb96_ga4_sa1024", 2048, 96, 4, 49, 0, 1024, 2, 8, 1, 1),
+                ("jax_r7_06_fsdp16_s4096_mb48_ga2_sa1024", 4096, 48, 2, 49, 0, 1024, 1, 16, 1, 1),
+                ("jax_r7_07_dp2_fsdp8_s4096_mb48_ga2_sa1024", 4096, 48, 2, 49, 0, 1024, 2, 8, 1, 1),
+            ]
+            summary_filename = "jax_v5p16_r7_sweep_summary.json"
+        elif args.sweep_v5p32_r6:
             # (exp_name, seq_len, mb, ga, remat_n, save_splash, sa_block, dp, fsdp, ep, tp)
             sweep_specs = [
                 ("jax_v5p32_01_fsdp32_s2048_mb64_ga2_sa1024", 2048, 64, 2, 49, 0, 1024, 1, 32, 1, 1),

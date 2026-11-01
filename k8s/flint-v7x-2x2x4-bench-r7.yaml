@@ -1,0 +1,171 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: flint-v7x16-jax-bench-r7-svc
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    job-name: flint-v7x16-jax-bench-r7
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flint-v7x16-jax-bench-r7
+  namespace: default
+  labels:
+    app: flint-v7x16-jax-bench-r7
+spec:
+  backoffLimit: 8
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  template:
+    metadata:
+      labels:
+        app: flint-v7x16-jax-bench-r7
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      serviceAccountName: default
+      subdomain: flint-v7x16-jax-bench-r7-svc
+      terminationGracePeriodSeconds: 5
+      restartPolicy: OnFailure
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v7x-16-pool
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+      tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "cloud.google.com/gke-spot"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "cloud.google.com/gke-queued"
+          operator: "Exists"
+          effect: "NoSchedule"
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: scratch
+          emptyDir: {}
+      containers:
+        - name: jax-tpu-trainer
+          image: us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/torchtpu/torchtitan-flint:v0.2.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: JAX_PLATFORMS
+              value: "tpu,cpu"
+            - name: GRPC_DNS_RESOLVER
+              value: "native"
+            - name: GCS_BUCKET_ROOT
+              value: "gs://YOUR_GCS_BUCKET/flint-jax-training"
+            - name: LIBTPU_INIT_ARGS
+              value: >-
+                --xla_tpu_dvfs_p_state=7
+                --xla_tpu_overlap_compute_collective_tc=true
+                --xla_enable_async_all_gather=true
+                --xla_enable_async_all_reduce=true
+                --xla_tpu_enable_async_all_to_all=true
+                --xla_tpu_enable_ag_backward_pipelining=true
+                --xla_enable_async_collective_permute=true
+                --xla_tpu_enable_async_reduce_scatter=true
+                --xla_tpu_prefer_async_allgather_to_allreduce=true
+                --xla_tpu_copy_insertion_use_region_analysis=true
+                --xla_tpu_copy_insertion_use_region_analysis_limit=1000
+                --xla_tpu_enable_data_parallel_all_reduce_opt=true
+                --xla_tpu_data_parallel_opt_different_sized_ops=true
+                --xla_tpu_use_minor_sharding_for_major_trivial_input=true
+                --xla_tpu_relayout_group_size_threshold_for_reduce_scatter=1
+                --xla_tpu_assign_all_reduce_scatter_layout=true
+                --xla_tpu_enable_scheduler_memory_pressure_tracking=true
+                --xla_tpu_host_transfer_overlap_limit=24
+                --xla_max_concurrent_host_send_recv=100
+                --xla_tpu_use_enhanced_launch_barrier=false
+                --slicebuilder_use_insecure_grpc=true
+                --undefok=slicebuilder_use_insecure_grpc,xla_tpu_enable_async_reduce_scatter,xla_tpu_dvfs_p_state,xla_tpu_prefer_async_allgather_to_allreduce
+          resources:
+            requests:
+              google.com/tpu: "4"
+            limits:
+              google.com/tpu: "4"
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: scratch
+              mountPath: /scratch
+          command:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+              echo "=== JAX V7X-16 (2x2x4, 32 Ironwood TensorCores) R7 Frontier Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
+              mkdir -p /scratch/flint-jax-training /scratch/results
+              python3 - <<'PY'
+              import json, pathlib, urllib.parse, urllib.request
+              req = urllib.request.Request(
+                  "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+                  headers={"Metadata-Flavor": "Google"},
+              )
+              tok = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())["access_token"]
+              bucket = "YOUR_GCS_BUCKET"
+              files = [
+                  "flint_jax_r7/flint_jax/__init__.py",
+                  "flint_jax_r7/flint_jax/config.py",
+                  "flint_jax_r7/flint_jax/model.py",
+                  "flint_jax_r7/flint_jax/checkpoint_loader.py",
+                  "flint_jax_r7/flint_jax/train.py",
+              ]
+              for fn in files:
+                  obj = urllib.parse.quote(f"flint-jax-training/{fn}", safe="")
+                  r = urllib.request.Request(
+                      f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{obj}?alt=media",
+                      headers={"Authorization": f"Bearer {tok}"},
+                  )
+                  rel = fn.split("flint_jax_r7/", 1)[1]
+                  dst = pathlib.Path("/scratch/flint-jax-training") / rel
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  dst.write_bytes(urllib.request.urlopen(r, timeout=30).read())
+              cfg_obj = urllib.parse.quote("models/RecursiveSI/flint/config.json", safe="")
+              r_cfg = urllib.request.Request(
+                  f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{cfg_obj}?alt=media",
+                  headers={"Authorization": f"Bearer {tok}"},
+              )
+              pathlib.Path("/scratch/flint-jax-training/config.json").write_bytes(
+                  urllib.request.urlopen(r_cfg, timeout=30).read()
+              )
+              print("Downloaded flint_jax_r7 + config.json from GCS!", flush=True)
+              PY
+
+              export PYTHONPATH="/scratch/flint-jax-training:${PYTHONPATH:-}"
+
+              python3 -u -m flint_jax.train \
+                --config-json=/scratch/flint-jax-training/config.json \
+                --sweep-v7x16-r7 \
+                --steps=8 \
+                --sweep-output-dir=/scratch/results \
+                --gcs-results-prefix=flint-jax-training/results_v7x16_r7 2>&1 | tee "/scratch/results/sweep_v7x16_r7_w${JOB_COMPLETION_INDEX}.log"
+
+              python3 - <<'UP'
+              import json, pathlib, urllib.parse, urllib.request
+              req = urllib.request.Request(
+                  "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token",
+                  headers={"Metadata-Flavor": "Google"},
+              )
+              tok = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())["access_token"]
+              bucket = "YOUR_GCS_BUCKET"
+              for p in pathlib.Path("/scratch/results").glob("*"):
+                  obj = urllib.parse.quote(f"flint-jax-training/results_v7x16_r7/{p.name}", safe="")
+                  r = urllib.request.Request(
+                      f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o?uploadType=media&name={obj}",
+                      data=p.read_bytes(),
+                      method="POST",
+                      headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/octet-stream"},
+                  )
+                  urllib.request.urlopen(r, timeout=30).read()
+              print("Uploaded worker v7x16_r7 sweep artifacts to GCS!", flush=True)
+              UP
+              echo "=== ALL JAX R7 FRONTIER TPU v7x-16 (2x2x4) BENCHMARKS COMPLETE ==="

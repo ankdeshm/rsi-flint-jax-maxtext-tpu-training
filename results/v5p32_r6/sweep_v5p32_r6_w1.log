@@ -1,0 +1,21 @@
+2026-11-01 11:59:32,263 [INFO] [process=12] Initializing GKE TPU slice JAX runtime: worker_id=1/8, coordinator=10.164.8.11:8482
+2026-11-01 11:59:32,264 [INFO] [process=12] Connecting to JAX distributed service on 10.164.8.11:8482
+2026-11-01 11:59:42,475 [INFO] [process=12] JAX process 2/8 initialized | Local devices: 4 | Global devices: 32 (TPU v5)
+2026-11-01 11:59:42,477 [INFO] [process=12] === [jax_v5p32_01_fsdp32_s2048_mb64_ga2_sa1024] START: seq=2048, mb=64, ga=2 (tok/step=8388608), remat_n=49, mesh=(dp=1, fsdp=32, ep=1, tp=1), flops/tok=17.383G ===
+2026-11-01 12:00:37,687 [INFO] [process=12] [jax_v5p32_01_fsdp32_s2048_mb64_ga2_sa1024] Initialized sharded TrainState in 54.95s
+2026-11-01 12:12:25,623 [INFO] [process=12] === [jax_v5p32_02_dp2_fsdp16_s2048_mb64_ga2_sa1024] START: seq=2048, mb=64, ga=2 (tok/step=8388608), remat_n=49, mesh=(dp=2, fsdp=16, ep=1, tp=1), flops/tok=17.383G ===
+2026-11-01 12:13:26,585 [INFO] [process=12] [jax_v5p32_02_dp2_fsdp16_s2048_mb64_ga2_sa1024] Initialized sharded TrainState in 60.89s
+2026-11-01 12:21:37,509 [INFO] [process=12] === [jax_v5p32_03_dp2_fsdp16_s2048_mb80_ga2_sa1024_noattnremat12] START: seq=2048, mb=80, ga=2 (tok/step=10485760), remat_n=49, mesh=(dp=2, fsdp=16, ep=1, tp=1), flops/tok=17.383G ===
+2026-11-01 12:22:36,065 [INFO] [process=12] [jax_v5p32_03_dp2_fsdp16_s2048_mb80_ga2_sa1024_noattnremat12] Initialized sharded TrainState in 58.48s
+2026-11-01 12:24:24,506 [ERROR] [process=12] [jax_v5p32_03_dp2_fsdp16_s2048_mb80_ga2_sa1024_noattnremat12] FAILED with JaxRuntimeError: RESOURCE_EXHAUSTED: E1000: CompileTimeHbmOom: Ran out of memory on HBM, the total memory required for HLO temporaries (143.61G) exceeds available HBM (95.73G). HLO module: jit_train_step.
+See https://openxla.org/xla/errors/error_1000 for more details.
+2026-11-01 12:24:24,963 [INFO] [process=12] === [jax_v5p32_04_fsdp32_s2048_mb96_ga2_sa1024_noattnremat12] START: seq=2048, mb=96, ga=2 (tok/step=12582912), remat_n=49, mesh=(dp=1, fsdp=32, ep=1, tp=1), flops/tok=17.383G ===
+2026-11-01 12:25:26,796 [INFO] [process=12] [jax_v5p32_04_fsdp32_s2048_mb96_ga2_sa1024_noattnremat12] Initialized sharded TrainState in 61.76s
+2026-11-01 12:28:07,663 [ERROR] [process=12] [jax_v5p32_04_fsdp32_s2048_mb96_ga2_sa1024_noattnremat12] FAILED with JaxRuntimeError: RESOURCE_EXHAUSTED: E1000: CompileTimeHbmOom: Ran out of memory on HBM, the total memory required for HLO temporaries (170.40G) exceeds available HBM (95.73G). HLO module: jit_train_step.
+See https://openxla.org/xla/errors/error_1000 for more details.
+2026-11-01 12:28:17,512 [INFO] [process=12] === [jax_v5p32_05_dp2_fsdp16_s4096_mb32_ga2_sa1024_noattnremat12] START: seq=4096, mb=32, ga=2 (tok/step=8388608), remat_n=49, mesh=(dp=2, fsdp=16, ep=1, tp=1), flops/tok=18.793G ===
+2026-11-01 12:29:17,154 [INFO] [process=12] [jax_v5p32_05_dp2_fsdp16_s4096_mb32_ga2_sa1024_noattnremat12] Initialized sharded TrainState in 59.57s
+2026-11-01 12:30:53,443 [ERROR] [process=12] [jax_v5p32_05_dp2_fsdp16_s4096_mb32_ga2_sa1024_noattnremat12] FAILED with JaxRuntimeError: RESOURCE_EXHAUSTED: E1000: CompileTimeHbmOom: Ran out of memory on HBM, the total memory required for HLO temporaries (100.84G) exceeds available HBM (95.73G). HLO module: jit_train_step.
+See https://openxla.org/xla/errors/error_1000 for more details.
+2026-11-01 12:31:02,920 [INFO] [process=12] === [jax_v5p32_06_fsdp8_ep4_s2048_mb48_ga2_sa1024] START: seq=2048, mb=48, ga=2 (tok/step=6291456), remat_n=49, mesh=(dp=1, fsdp=8, ep=4, tp=1), flops/tok=17.383G ===
+2026-11-01 12:32:01,449 [INFO] [process=12] [jax_v5p32_06_fsdp8_ep4_s2048_mb48_ga2_sa1024] Initialized sharded TrainState in 58.45s
