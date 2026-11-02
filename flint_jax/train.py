@@ -569,17 +569,17 @@ def main() -> None:
     parser.add_argument("--summary-json", type=str, default=None, help="Optional path to write JSON benchmark summary")
     parser.add_argument("--sweep-v5p16", action="store_true", help="Run baseline 6-config 2x2x4 SPMD mesh sweep")
     parser.add_argument("--sweep-v5p16-opt", action="store_true", help="Run optimized high-MFU SplashAttention + fused ragged_dot hillclimb sweep on 2x2x4 TPU v5p")
-    parser.add_argument("--sweep-v5p16-r6", action="store_true", help="Run Round 6 high-batch (mb=64..96) + selective MLP-only remat + sa=1024 frontier sweep on 2x2x4 TPU v5p")
-    parser.add_argument("--sweep-v5p32-r6", action="store_true", help="Run Round 6 32-chip (2x4x4) TPU v5p-32 FSDP=32 + HSDP 2x16 + FSDP=8xEP=4 frontier sweep")
-    parser.add_argument("--sweep-v5p16-r7", action="store_true", help="Run Round 7 16-chip (2x2x4) HSDP 2x8 + mb=96..112 + ga=4 + 4K frontier sweep")
-    parser.add_argument("--sweep-v5p32-r7", action="store_true", help="Run Round 7 32-chip (2x4x4) HSDP 2x16 mb=80..112 + ga=4 + HSDP 4x8 + 4K frontier sweep")
-    parser.add_argument("--sweep-v7x16-r7", action="store_true", help="Run Round 7 Ironwood v7x-16 (2x2x4, 32 TensorCores) FSDP=32 + HSDP 2x16 + HSDP 4x8 frontier sweep")
+    parser.add_argument("--sweep-v5p16-r6", action="store_true", help="Run Round 6 high-batch (mb=64..96) + selective MLP-only remat + sa=1024 scaling sweep on 2x2x4 TPU v5p")
+    parser.add_argument("--sweep-v5p32-r6", action="store_true", help="Run Round 6 32-chip (2x4x4) TPU v5p-32 FSDP=32 + HSDP 2x16 + FSDP=8xEP=4 scaling sweep")
+    parser.add_argument("--sweep-v5p16-r7", action="store_true", help="Run Round 7 16-chip (2x2x4) HSDP 2x8 + mb=96..112 + ga=4 + 4K scaling sweep")
+    parser.add_argument("--sweep-v5p32-r7", action="store_true", help="Run Round 7 32-chip (2x4x4) HSDP 2x16 mb=80..112 + ga=4 + HSDP 4x8 + 4K scaling sweep")
+    parser.add_argument("--sweep-v7x16-r7", action="store_true", help="Run Round 7 Ironwood v7x-16 (2x2x4, 32 TensorCores) FSDP=32 + HSDP 2x16 + HSDP 4x8 scaling sweep")
     parser.add_argument("--sweep-v7x16-r8", action="store_true", help="Run Round 8 Ironwood v7x-16 (2x2x4, 32 TensorCores) HBM-calibrated mb=32..64 + HSDP 2x16 + EP=4 sweep")
-    parser.add_argument("--sweep-v5p16-r8", action="store_true", help="Run Round 8 16-chip (2x2x4) high-AI 4K/8K/16K long-context FSDP=16 MFU frontier sweep")
-    parser.add_argument("--sweep-v5p32-r8", action="store_true", help="Run Round 8 32-chip (2x4x4) high-AI 4K/8K/16K long-context HSDP 2x16 MFU frontier sweep")
-    parser.add_argument("--sweep-v7x16-r9", action="store_true", help="Run Round 9 Ironwood v7x-16 4K/8K/16K/32K/64K long-context MFU frontier sweep")
-    parser.add_argument("--sweep-v5p16-r9", action="store_true", help="Run Round 9 16-chip (2x2x4) 32K/64K/128K ultra-long-context + shared_mem=32% MFU frontier sweep")
-    parser.add_argument("--sweep-v5p32-r9", action="store_true", help="Run Round 9 32-chip (2x4x4) 32K/64K/128K ultra-long-context + shared_mem=32% MFU frontier sweep")
+    parser.add_argument("--sweep-v5p16-r8", action="store_true", help="Run Round 8 16-chip (2x2x4) high-AI 4K/8K/16K long-context FSDP=16 MFU scaling sweep")
+    parser.add_argument("--sweep-v5p32-r8", action="store_true", help="Run Round 8 32-chip (2x4x4) high-AI 4K/8K/16K long-context HSDP 2x16 MFU scaling sweep")
+    parser.add_argument("--sweep-v7x16-r9", action="store_true", help="Run Round 9 Ironwood v7x-16 4K/8K/16K/32K/64K long-context MFU scaling sweep")
+    parser.add_argument("--sweep-v5p16-r9", action="store_true", help="Run Round 9 16-chip (2x2x4) 32K/64K/128K long-context + shared_mem=32% MFU scaling sweep")
+    parser.add_argument("--sweep-v5p32-r9", action="store_true", help="Run Round 9 32-chip (2x4x4) 32K/64K/128K long-context + shared_mem=32% MFU scaling sweep")
     parser.add_argument("--sweep-output-dir", type=str, default="/scratch/results", help="Local directory for sweep JSON outputs")
     parser.add_argument("--gcs-results-prefix", type=str, default="flint-jax-training/results", help="GCS prefix for immediate result upload")
     args = parser.parse_args()
@@ -668,7 +668,7 @@ def main() -> None:
         import json as _json
 
         if args.sweep_v5p16_r9:
-            # Ultra-high arithmetic-intensity 32K/64K/128K SplashAttention + ragged_dot frontier on v5p-16 (FSDP=16)
+            # High arithmetic-intensity 32K/64K/128K SplashAttention + ragged_dot sweep on v5p-16 (FSDP=16)
             sweep_specs = [
                 ("jax_v5p16_r9_01_fsdp16_s32768_mb6_ga2_sa1024", 32768, 6, 2, 49, 0, 1024, 1, 16, 1, 1),
                 ("jax_v5p16_r9_02_fsdp16_s65536_mb3_ga2_sa1024", 65536, 3, 2, 49, 0, 1024, 1, 16, 1, 1),
@@ -679,7 +679,7 @@ def main() -> None:
             ]
             summary_filename = "jax_v5p16_r9_sweep_summary.json"
         elif args.sweep_v5p32_r9:
-            # Ultra-high arithmetic-intensity 32K/64K/128K SplashAttention + ragged_dot frontier on v5p-32 (HSDP 2x16)
+            # High arithmetic-intensity 32K/64K/128K SplashAttention + ragged_dot sweep on v5p-32 (HSDP 2x16)
             sweep_specs = [
                 ("jax_v5p32_r9_01_dp2_fsdp16_s32768_mb6_ga2_sa1024", 32768, 6, 2, 49, 0, 1024, 2, 16, 1, 1),
                 ("jax_v5p32_r9_02_dp2_fsdp16_s65536_mb3_ga2_sa1024", 65536, 3, 2, 49, 0, 1024, 2, 16, 1, 1),
@@ -690,7 +690,7 @@ def main() -> None:
             ]
             summary_filename = "jax_v5p32_r9_sweep_summary.json"
         elif args.sweep_v5p16_r8:
-            # High-arithmetic-intensity 4K/8K/16K SplashAttention + ragged_dot frontier on v5p-16 (FSDP=16)
+            # High-arithmetic-intensity 4K/8K/16K SplashAttention + ragged_dot sweep on v5p-16 (FSDP=16)
             sweep_specs = [
                 ("jax_v5p16_r8_01_fsdp16_s4096_mb56_ga2_sa1024", 4096, 56, 2, 49, 0, 1024, 1, 16, 1, 1),
                 ("jax_v5p16_r8_02_fsdp16_s4096_mb64_ga2_sa1024", 4096, 64, 2, 49, 0, 1024, 1, 16, 1, 1),
@@ -701,7 +701,7 @@ def main() -> None:
             ]
             summary_filename = "jax_v5p16_r8_sweep_summary.json"
         elif args.sweep_v5p32_r8:
-            # High-arithmetic-intensity 4K/8K/16K SplashAttention + ragged_dot frontier on v5p-32 (HSDP 2x16)
+            # High-arithmetic-intensity 4K/8K/16K SplashAttention + ragged_dot sweep on v5p-32 (HSDP 2x16)
             sweep_specs = [
                 ("jax_v5p32_r8_01_dp2_fsdp16_s4096_mb56_ga2_sa1024", 4096, 56, 2, 49, 0, 1024, 2, 16, 1, 1),
                 ("jax_v5p32_r8_02_dp2_fsdp16_s4096_mb64_ga2_sa1024", 4096, 64, 2, 49, 0, 1024, 2, 16, 1, 1),
@@ -712,7 +712,7 @@ def main() -> None:
             ]
             summary_filename = "jax_v5p32_r8_sweep_summary.json"
         elif args.sweep_v7x16_r9:
-            # Ironwood v7x-16 (32 TensorCores) HSDP 2x16 2K -> 4K -> 8K -> 16K -> 32K -> 64K MFU frontier
+            # Ironwood v7x-16 (32 TensorCores) HSDP 2x16 2K -> 4K -> 8K -> 16K -> 32K -> 64K MFU sweep
             sweep_specs = [
                 ("jax_v7x16_r9_01_dp2_fsdp16_s4096_mb32_ga2_sa1024", 4096, 32, 2, 49, 0, 1024, 2, 16, 1, 1),
                 ("jax_v7x16_r9_02_dp2_fsdp16_s8192_mb16_ga2_sa1024", 8192, 16, 2, 49, 0, 1024, 2, 16, 1, 1),

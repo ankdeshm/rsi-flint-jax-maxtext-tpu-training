@@ -95,7 +95,7 @@ spec:
             - -lc
             - |
               set -euo pipefail
-              echo "=== JAX V5P-32 (2x4x4) R6 Frontier Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
+              echo "=== JAX V5P-32 (2x4x4) R6 Benchmark Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
               mkdir -p /scratch/flint-jax-training /scratch/results
               python3 - <<'PY'
               import json, pathlib, urllib.parse, urllib.request
@@ -161,4 +161,4 @@ spec:
                   urllib.request.urlopen(r, timeout=30).read()
               print("Uploaded worker v5p32_r6 sweep artifacts to GCS!", flush=True)
               UP
-              echo "=== ALL JAX R6 FRONTIER TPU v5p-32 (2x4x4) BENCHMARKS COMPLETE ==="
+              echo "=== ALL JAX R6 BENCHMARK TPU v5p-32 (2x4x4) BENCHMARKS COMPLETE ==="

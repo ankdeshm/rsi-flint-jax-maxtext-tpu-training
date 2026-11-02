@@ -95,7 +95,7 @@ spec:
             - -lc
             - |
               set -euo pipefail
-              echo "=== JAX V5P-32 (2x4x4) R9 Ultra-Long-Context (32K/64K/128K, shared_mem=32%) Frontier Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
+              echo "=== JAX V5P-32 (2x4x4) R9 Long-Context (32K/64K/128K, shared_mem=32%) Benchmark Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
               mkdir -p /scratch/flint-jax-training /scratch/results
               python3 - <<'PY'
               import json, pathlib, urllib.parse, urllib.request

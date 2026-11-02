@@ -99,7 +99,7 @@ spec:
             - -lc
             - |
               set -euo pipefail
-              echo "=== JAX V7X-16 (2x2x4, 32 Ironwood TensorCores) R9 4K/8K/16K/32K/64K/128K Frontier Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
+              echo "=== JAX V7X-16 (2x2x4, 32 Ironwood TensorCores) R9 4K/8K/16K/32K/64K/128K Benchmark Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
               mkdir -p /scratch/flint-jax-training /scratch/results
               python3 - <<'PY'
               import json, pathlib, urllib.parse, urllib.request

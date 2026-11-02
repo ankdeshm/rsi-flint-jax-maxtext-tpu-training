@@ -102,7 +102,7 @@ spec:
             - -lc
             - |
               set -euo pipefail
-              echo "=== JAX V7X-16 (2x2x4, 32 Ironwood TensorCores) R7 Frontier Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
+              echo "=== JAX V7X-16 (2x2x4, 32 Ironwood TensorCores) R7 Benchmark Worker ${JOB_COMPLETION_INDEX} starting on $(hostname) ==="
               mkdir -p /scratch/flint-jax-training /scratch/results
               python3 - <<'PY'
               import json, pathlib, urllib.parse, urllib.request
@@ -168,4 +168,4 @@ spec:
                   urllib.request.urlopen(r, timeout=30).read()
               print("Uploaded worker v7x16_r7 sweep artifacts to GCS!", flush=True)
               UP
-              echo "=== ALL JAX R7 FRONTIER TPU v7x-16 (2x2x4) BENCHMARKS COMPLETE ==="
+              echo "=== ALL JAX R7 BENCHMARK TPU v7x-16 (2x2x4) BENCHMARKS COMPLETE ==="

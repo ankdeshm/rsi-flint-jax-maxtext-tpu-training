@@ -1,6 +1,6 @@
 # `results/` Guide — `RecursiveSI/flint` Pure JAX / Flax & MaxText TPU Training
 
-| Folder / File | Slice & Pass | Highlight Record | Summary JSON |
+| Folder / File | Slice & Pass | Key Results | Summary JSON |
 |---|---|---|---|
 | [`v5p32_r8/`](./v5p32_r8/) | **TPU `v5p-32` (`2x4x4`) `r8`** | **`33.72%` Steady / `33.76%` Peak MFU @ `16K` (`jax_v5p32_r8_05`), `30.20%` @ `8K` (`r8_03`)** | [`jax_v5p32_r8_sweep_summary.json`](./v5p32_r8/jax_v5p32_r8_sweep_summary.json) |
 | [`r8/`](./r8/) | **TPU `v5p-16` (`2x2x4`) `r8`** | **`31.91%` Steady / `31.97%` Peak MFU @ `16K` (`jax_v5p16_r8_05`), `28.47%` @ `8K` (`r8_03`)** | [`jax_v5p16_r8_sweep_summary.json`](./r8/jax_v5p16_r8_sweep_summary.json) |
