@@ -226,8 +226,20 @@ def train_step(
     return new_state, metrics
 
 
-def compute_active_flops_per_token(config: FlintJAXConfig, seq_len: int) -> float:
-    """Computes exact active training FLOPs/token (6*N_active + causal/SWA attention FLOPs)."""
+def compute_active_flops_per_token(
+    config: FlintJAXConfig, seq_len: int, *, causal: bool = True
+) -> float:
+    """Computes active training FLOPs/token for RecursiveSI/flint.
+
+    Args:
+      config: FlintJAXConfig matching RecursiveSI/flint/config.json.
+      seq_len: Training sequence length S.
+      causal: If True (default), uses exact causal-masked lower-triangle FLOPs
+        (mean (S+1)/2 attended keys on the 14 full causal layers, and exact causal
+        window ramp on the 35 one-sided W=513 sliding-window layers). If False,
+        uses the upstream PaLM / MaxText / TorchTitan full-square convention
+        (12 * q_dim * min(S, W), without halving for causal masking).
+    """
     h = config.hidden_size
     q_dim = config.num_attention_heads * config.head_dim
     kv_dim = config.num_key_value_heads * config.head_dim
@@ -244,8 +256,15 @@ def compute_active_flops_per_token(config: FlintJAXConfig, seq_len: int) -> floa
     )
     n_active = n_lm_head + n_attn + n_dense_mlp + n_moe_mlp
     attn_flops = 0.0
+    w = config.sliding_window
     for layer_id in range(config.num_hidden_layers):
-        eff_ctx = min(seq_len, config.sliding_window) if config.is_sliding_layer(layer_id) else seq_len
+        if causal:
+            if config.is_sliding_layer(layer_id):
+                eff_ctx = (seq_len + 1.0) / 2.0 if seq_len <= w else (w - (w * (w - 1.0)) / (2.0 * seq_len))
+            else:
+                eff_ctx = (seq_len + 1.0) / 2.0
+        else:
+            eff_ctx = float(min(seq_len, w) if config.is_sliding_layer(layer_id) else seq_len)
         attn_flops += 12.0 * q_dim * eff_ctx
     return 6.0 * n_active + attn_flops
 
@@ -311,14 +330,15 @@ def run_single_experiment(
     num_devs = jax.device_count()
     micro_global_bs = per_device_batch_size * num_devs
     tokens_per_step = micro_global_bs * seq_len * grad_accum_steps
-    flops_per_token = compute_active_flops_per_token(config, seq_len)
+    flops_per_token = compute_active_flops_per_token(config, seq_len, causal=True)
+    palm_flops_per_token = compute_active_flops_per_token(config, seq_len, causal=False)
     dev_kind = jax.devices()[0].device_kind
-    peak_tflops_per_chip = (
-        459.0 if "v5p" in dev_kind.lower() or "v5" in dev_kind.lower() else 1153.5
-    )
+    is_v5 = "v5p" in dev_kind.lower() or "v5" in dev_kind.lower()
+    peak_tflops_per_device = 459.0 if is_v5 else 1153.5
+    devices_per_physical_chip = 1 if is_v5 else 2
 
     logger.info(
-        "=== [%s] START: seq=%d, mb=%d, ga=%d (tok/step=%d), remat_n=%d, mesh=(dp=%d, fsdp=%d, ep=%d, tp=%d), flops/tok=%.3fG ===",
+        "=== [%s] START: seq=%d, mb=%d, ga=%d (tok/step=%d), remat_n=%d, mesh=(dp=%d, fsdp=%d, ep=%d, tp=%d), causal_flops/tok=%.3fG (palm=%.3fG) ===",
         exp_name,
         seq_len,
         per_device_batch_size,
@@ -330,6 +350,7 @@ def run_single_experiment(
         expert_parallel,
         tensor_parallel,
         flops_per_token / 1e9,
+        palm_flops_per_token / 1e9,
     )
 
     mesh = create_tpu_mesh(
@@ -421,8 +442,10 @@ def run_single_experiment(
                 jax.block_until_ready(metrics["total_loss"])
                 dt = time.perf_counter() - step_t0
                 tokens_per_sec = tokens_per_step / dt
-                tps_per_chip = tokens_per_sec / num_devs
-                mfu_pct = (tps_per_chip * flops_per_token) / (peak_tflops_per_chip * 1e12) * 100.0
+                tps_per_device = tokens_per_sec / num_devs
+                tps_per_physical_chip = tps_per_device * devices_per_physical_chip
+                mfu_pct = (tps_per_device * flops_per_token) / (peak_tflops_per_device * 1e12) * 100.0
+                palm_mfu_pct = (tps_per_device * palm_flops_per_token) / (peak_tflops_per_device * 1e12) * 100.0
                 mem_stats = jax.local_devices()[0].memory_stats() or {}
                 cur_hbm_gib = mem_stats.get("bytes_in_use", 0) / (1024 ** 3)
                 peak_hbm_gib = mem_stats.get("peak_bytes_in_use", 0) / (1024 ** 3)
@@ -435,7 +458,10 @@ def run_single_experiment(
                     "grad_norm": round(float(metrics["grad_norm"]), 4),
                     "step_time_s": round(dt, 4),
                     "cluster_tok_s": round(tokens_per_sec, 1),
-                    "chip_tok_s": round(tps_per_chip, 1),
+                    "device_tok_s": round(tps_per_device, 1),
+                    "chip_tok_s": round(tps_per_physical_chip, 1),
+                    "causal_mfu_pct": round(mfu_pct, 2),
+                    "palm_mfu_pct": round(palm_mfu_pct, 2),
                     "mfu_pct": round(mfu_pct, 2),
                     "cur_hbm_gib": round(cur_hbm_gib, 2),
                     "peak_hbm_gib": round(peak_hbm_gib, 2),
@@ -444,7 +470,7 @@ def run_single_experiment(
 
                 if jax.process_index() == 0:
                     logger.info(
-                        "[%s] Step %04d/%04d | loss=%.4f (lm=%.4f aux=%.5f) | gnorm=%.4f | dt=%.3fs | chip_tps=%.1f | slice_tps=%.1f | MFU=%.2f%% | HBM=%.2f/%.2fGiB",
+                        "[%s] Step %04d/%04d | loss=%.4f (lm=%.4f aux=%.5f) | gnorm=%.4f | dt=%.3fs | chip_tps=%.1f (dev_tps=%.1f) | slice_tps=%.1f | causal_MFU=%.2f%% (PaLM_MFU=%.2f%%) | HBM=%.2f/%.2fGiB",
                         exp_name,
                         step,
                         steps,
@@ -453,9 +479,11 @@ def run_single_experiment(
                         rec["moe_aux_loss"],
                         rec["grad_norm"],
                         dt,
-                        tps_per_chip,
+                        tps_per_physical_chip,
+                        tps_per_device,
                         tokens_per_sec,
                         mfu_pct,
+                        palm_mfu_pct,
                         cur_hbm_gib,
                         peak_hbm_gib,
                     )
@@ -469,6 +497,7 @@ def run_single_experiment(
             "status": "PASS_WITH_NAN" if has_nan else "PASS",
             "device_kind": dev_kind,
             "num_devices": num_devs,
+            "num_physical_chips": num_devs // devices_per_physical_chip,
             "seq_len": seq_len,
             "per_device_batch_size": per_device_batch_size,
             "grad_accum_steps": grad_accum_steps,
@@ -477,8 +506,10 @@ def run_single_experiment(
             "splash_block_size": config.splash_block_size,
             "use_splash_attention": config.use_splash_attention,
             "tokens_per_step": tokens_per_step,
-            "flops_per_token_g": round(flops_per_token / 1e9, 4),
-            "peak_tflops_per_chip": peak_tflops_per_chip,
+            "causal_flops_per_token_g": round(flops_per_token / 1e9, 4),
+            "palm_flops_per_token_g": round(palm_flops_per_token / 1e9, 4),
+            "peak_tflops_per_device": peak_tflops_per_device,
+            "peak_tflops_per_chip": peak_tflops_per_device * devices_per_physical_chip,
             "mesh": {
                 "data": data_parallel,
                 "fsdp": fsdp_parallel,
@@ -487,10 +518,12 @@ def run_single_experiment(
             },
             "compile_step1_s": step_records[0]["step_time_s"],
             "steady_step_time_s": round(_stats.median([r["step_time_s"] for r in steady]), 4),
+            "steady_device_tok_s": round(_stats.median([r["device_tok_s"] for r in steady]), 1),
             "steady_chip_tok_s": round(_stats.median([r["chip_tok_s"] for r in steady]), 1),
             "steady_cluster_tok_s": round(_stats.median([r["cluster_tok_s"] for r in steady]), 1),
-            "steady_mfu_pct": round(_stats.median([r["mfu_pct"] for r in steady]), 2),
-            "peak_mfu_pct": round(max(r["mfu_pct"] for r in steady), 2),
+            "steady_causal_mfu_pct": round(_stats.median([r["causal_mfu_pct"] for r in steady]), 2),
+            "steady_palm_mfu_pct": round(_stats.median([r["palm_mfu_pct"] for r in steady]), 2),
+            "steady_mfu_pct": round(_stats.median([r["causal_mfu_pct"] for r in steady]), 2),
             "cur_hbm_gib": round(max(r["cur_hbm_gib"] for r in steady), 2),
             "peak_hbm_gib": round(max(r["peak_hbm_gib"] for r in step_records), 2),
             "loss_start": step_records[0]["lm_loss"],
